@@ -15,16 +15,29 @@
 # ------------------------------------------------------------
 
 import fitz  # PyMuPDF
-import os, glob, re, json
+import os, glob, re, json, math
 import pandas as pd
 import datetime
 from typing import List, Optional, Dict, Tuple, Set
+import json
+from pathlib import Path
+from collections import defaultdict
+try:
+    from rapidfuzz import fuzz
+except:
+    fuzz = None
 
 # === CONFIG: YOUR FOLDERS ===
 REPORTS_DIR = r"D:\FORSMITH - AI\Dataset\Reports"
 IMAGES_DIR  = r"D:\FORSMITH - AI\Dataset\Images"
 CSV_OUTPUT  = r"D:\FORSMITH - AI\Dataset\image_metadata.csv"
 RUN_HISTORY_TXT = r"D:\FORSMITH - AI\Dataset\run_summary.txt" # Save a one-run summary (overwrites each run)
+LABELS_JSON = r"D:\FORSMITH - AI\Code\Label_Extraction\forsmith_roof_labels.json" # Path to the JSON produced by make_labels_json.py
+
+# Globals initialized once from JSON so extract_images_on_page() can use them
+taxonomy_by_canonical: Dict[str, Dict[str, str]] = {}
+labels_by_category: Dict[str, Set[str]] = {}
+all_labels_canonical: Set[str] = set()
 
 # === EXTRACT BEHAVIOR SWITCHES ===
 OBS_FALLBACK = False   # <- disable raster fallback crops entirely
@@ -55,6 +68,21 @@ KEEP_X0_RANGE = (40, 125)
 KEEP_X1_RANGE = (225, 350)
 KEEP_Y0_RANGE = (50, 600)
 KEEP_Y1_RANGE = (200, 760)
+
+# ---------- CONFIG ----------
+LABELING_CFG = {
+    "gutter_px": 12,
+    "top_pad_px": 6,
+    "bottom_pad_px": 10,
+    "right_margin_px": 18,
+    "header_ymax": 90,        # adjust to your page units
+    "footer_ymin_from_bottom": 80,  # pixels from bottom considered footer
+    "min_panel_width": 80,
+    "fuzzy_strict": 0.90,
+    "fuzzy_loose": 0.80,
+    "bm25_weight": 0.10,      # optional boost when using simple term scoring
+    "debug_visualize": False,
+}
 
 # === TEXT HINT PATTERNS ===
 TOC_HEADER_PATTERNS = [r"\btable of contents\b", r"^\s*contents\s*$"]
@@ -111,8 +139,14 @@ STRONG_INLINE_TOKENS = [
 ]
 
 # === LABEL / FIELD PARSING ===
-FIELD_TOKENS = ["Observation", "Observations", "Discussion", "Description", "Issue",
-                "Recommendation", "Location", "Priority"]
+# === LABEL / FIELD PARSING ===
+FIELD_TOKENS = [
+    "Observation", "Observations",
+    "Discussion", "Description", "Issue",
+    "Recommendation", "Location", "Priority",
+    "Cause/Effect", "Photograph"
+]
+
 FIELD_PATTERN = r"(?i)\b({})\b\s*[:\-–—]\s*".format("|".join(FIELD_TOKENS))
 
 PHOTO_ID_RX = re.compile(r"(?i)\bphotograph\s*[:\-–—]?\s*([0-9]+(?:\.[0-9]+)?)")
@@ -122,7 +156,6 @@ OBS_RX = re.compile(
 DISC_OR_DESC_RX = re.compile(
     r"(?is)\b(discussion|description)\b\s*[:\-–—]\s*(.+?)(?=\b(observation[s]?|discussion|description|issue|recommendation|location|priority)\b\s*[:\-–—]|$)"
 )
-
 
 # --- Domain headings (top-level) ---
 ROOF_DOMAIN_HEADINGS = [
@@ -147,6 +180,255 @@ APPENDIX_HEADING_START = r"(?mi)^\s*appendix(?:\s+[A-Z0-9]+)?\b"
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # ------------------------ Text / block helpers ------------------------
+
+def _canon(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^\w\s]", " ", s)     # drop punctuation
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _normalize_cat_key(cat_raw: str) -> str:
+    """
+    Map a variety of sheet/category strings to a canonical 'N.0' form.
+    Examples:
+      '3.0', '3', '3)', '3. Surface' -> '3.0'
+      'Section 6 - Penetrations'     -> '6.0'
+    If no leading 1-7 digit is found, returns the stripped original.
+    """
+    s = (cat_raw or "").strip()
+    m = re.match(r"^\s*([1-7])(?:[\.\)]\s*|(?:\s+|$))", s)
+    if m:
+        return f"{m.group(1)}.0"
+    return s
+
+def load_labels_from_json(json_path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Set[str]], Set[str]]:
+    """
+    Load labels from the JSON produced by make_labels_json.py and build:
+      - taxonomy_by_canonical: { canon(label) -> {"label": <str>, "category": "N.0"} }
+      - labels_by_category: { "N.0" -> set( canon(label), ... ) }
+      - all_labels_canonical: set( canon(label) for all labels )
+    """
+    p = Path(json_path)  # accept str or Path
+    if not p.exists():
+        raise FileNotFoundError(f"Labels JSON not found: {p}")
+
+    with open(p, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    # Your file is a dict with an "items" array
+    if isinstance(raw, dict) and "items" in raw:
+        items = raw["items"]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        raise ValueError("Unexpected labels JSON structure: expected dict with 'items' or a list.")
+
+    taxonomy_by_canonical: Dict[str, Dict[str, str]] = {}
+    labels_by_category: Dict[str, Set[str]] = defaultdict(set)
+
+    for item in items:
+        # guard: each item must be a dict
+        if not isinstance(item, dict):
+            continue
+
+        # Label text (your JSON uses "label")
+        lab = str(item.get("label", "")).strip()
+        if not lab:
+            continue
+
+        # Category comes from 'sheet' (e.g., '3.0 - Membrane'); fall back to 'category' if present
+        cat_raw = str(item.get("sheet", item.get("category", ""))).strip()
+        # Use your existing helper to normalize to 'N.0'
+        cat_key = _normalize_cat_key(cat_raw)
+
+        # Canonicalize the label using your existing helper
+        can = _canon(lab)
+
+        taxonomy_by_canonical[can] = {"label": lab, "category": cat_key}
+        if cat_key:
+            labels_by_category[cat_key].add(can)
+
+    all_labels_canonical = set(taxonomy_by_canonical.keys())
+    return taxonomy_by_canonical, labels_by_category, all_labels_canonical
+
+def compute_right_region(img_bbox, page_w, page_h, cfg, visible_y0=None):
+    x0, y0, x1, y1 = img_bbox
+    gutter = cfg["gutter_px"]
+    top_pad = cfg["top_pad_px"]
+    bot_pad = cfg["bottom_pad_px"]
+    right_margin = cfg["right_margin_px"]
+
+    rx0 = min(max(x1 + gutter, 0), page_w)
+    nominal_y0 = y0 if visible_y0 is None else max(y0, visible_y0)
+    ry0 = max(nominal_y0 - top_pad, 0)
+    rx1 = max(page_w - right_margin, rx0 + 1)
+    ry1 = min(y1 + bot_pad, page_h)
+    return (rx0, ry0, rx1, ry1)
+
+def blockdict_in_region(page, region):
+    """Return list of text blocks (with lines/spans) intersecting region."""
+    info = page.get_text("dict")
+    rx0, ry0, rx1, ry1 = region
+    blocks = []
+    for b in info.get("blocks", []):
+        if b.get("type", 0) != 0:
+            continue
+        bx0, by0, bx1, by1 = b["bbox"]
+        # simple intersection test
+        if bx1 < rx0 or bx0 > rx1 or by1 < ry0 or by0 > ry1:
+            continue
+        blocks.append(b)
+    # sort by top-left
+    blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+    return blocks
+
+def stitch_lines_preserve_period_breaks(blocks):
+    """Return text (with newlines only after lines ending with '.') and also line records."""
+    lines_out = []
+    for b in blocks:
+        for l in b.get("lines", []):
+            # concatenate spans
+            text = "".join(s["text"] for s in l.get("spans", []))
+            text = text.strip()
+            if not text:
+                continue
+            lines_out.append((l["bbox"], text))
+
+    # join with rule: keep newline if line ends with '.', else soft-join with space
+    out = []
+    for i, (_, line) in enumerate(lines_out):
+        if not out:
+            out.append(line)
+        else:
+            if re.search(r"\.\s*$", out[-1]):
+                out.append(line)
+            else:
+                out[-1] = (out[-1] + " " + line).strip()
+
+    return "\n".join(out), lines_out
+
+OBS_REGEX = re.compile(r"^\s*observations?\s*:?\s*$", re.I)
+DISC_REGEX = re.compile(r"^\s*(discussion|description)\s*:?\s*$", re.I)
+RECO_REGEX = re.compile(r"^\s*recommendations?\s*:?\s*$", re.I)
+SEC_REGEX  = re.compile(r"^\s*([1-7])\.(\d+)\s+(.+)$")   # e.g., 3.0 Roof Penetrations
+
+def parse_panel_sections(text: str):
+    """
+    Split panel into sections by headings.
+    Returns dict: {"observation": str|None, "discussion": str|None, "recommendation": str|None}
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    current = None
+    buckets = {"observation": [], "discussion": [], "recommendation": []}
+    for l in lines:
+        if OBS_REGEX.match(l):
+            current = "observation"; continue
+        if DISC_REGEX.match(l):
+            current = "discussion"; continue
+        if RECO_REGEX.match(l):
+            current = "recommendation"; continue
+        if current:
+            buckets[current].append(l)
+        else:
+            # no heading yet; keep as leading content (could be observation text)
+            if not buckets["observation"]:
+                buckets["observation"].append(l)
+            else:
+                # fall into discussion if observation already has something
+                buckets["discussion"].append(l)
+    return {k: ("\n".join(v).strip() if v else None) for k, v in buckets.items()}
+
+def token_set_ratio(a: str, b: str) -> float:
+    """0..1 simple token set similarity if rapidfuzz isn't available."""
+    A = set(_canon(a).split())
+    B = set(_canon(b).split())
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+def match_label(observation_text: str, taxonomy_by_canonical, all_labels_canonical, strict=0.90, loose=0.80):
+    if not observation_text:
+        return None, 0.0
+    c = _canon(observation_text)
+    if c in all_labels_canonical:
+        lab = taxonomy_by_canonical[c]["label"]
+        return lab, 1.0
+    # fuzzy
+    best_lab = None
+    best_score = -1.0
+    for can in all_labels_canonical:
+        cand_lab = taxonomy_by_canonical[can]["label"]
+        if fuzz:
+            score = fuzz.token_set_ratio(c, can) / 100.0
+        else:
+            score = token_set_ratio(c, can)
+        if score > best_score:
+            best_score, best_lab = score, cand_lab
+    if best_score >= strict:
+        return best_lab, best_score
+    if best_score >= loose:
+        return best_lab, best_score
+    return None, best_score
+
+def infer_category_for_other(panel_text: str, page_text_above: str, current_section: str, labels_by_category):
+    """
+    Returns (category, confidence, reasons)
+    Priority: current_section → page_text_above heading → keyword priors.
+    Robust to missing categories in taxonomy.
+    """
+    reasons = []
+
+    # 1) current section (only if present in taxonomy)
+    if current_section and current_section in labels_by_category:
+        reasons.append(f"Section prior {current_section}")
+        return current_section, 0.85, reasons
+
+    # 2) detect heading above in page_text_above
+    m = SEC_REGEX.search(page_text_above or "")
+    if m:
+        cat = f"{m.group(1)}.0"
+        if cat in labels_by_category:
+            reasons.append(f"Nearest heading {m.group(0)} → {cat}")
+            return cat, 0.75, reasons
+
+    # 3) keyword priors (lightweight keyword → category mapping)
+    KW = {
+        "2.0": ["membrane","blister","lap","seam","puncture","fishmouth","fastener","base sheet","cap sheet"],
+        "3.0": ["debris","vegetation","organic","algae","stain","surface","fines","gravel","granule"],
+        "4.0": ["parapet","coping","counterflashing","edge metal","termination bar","curb","wall"],
+        "5.0": ["drain","scupper","gutter","leader","downspout","overflow","ponding","sump"],
+        "6.0": ["penetration","pipe","vent","stack","conduit","pitch pocket","equipment","flashing"],
+        "7.0": ["safety","guardrail","access","ladder","fall","tie-off","hatch"],
+        "1.0": ["general","deck","structure","insulation","moisture","wet","slope","taper","thermal"],
+    }
+
+    text = f"{panel_text or ''}".lower()
+    scores = {cat: 0 for cat in KW.keys() if cat in labels_by_category}
+
+    for cat, kws in KW.items():
+        if cat not in scores:
+            continue
+        for k in kws:
+            if k in text:
+                scores[cat] += 1
+
+    if scores:
+        best = max(scores, key=lambda k: scores[k])
+        if scores[best] > 0:
+            reasons.append(f"Keyword prior {best} (hits={scores[best]})")
+            return best, 0.60 + min(0.2, 0.05 * scores[best]), reasons
+
+    # 4) fallback
+    fallback = "1.0" if "1.0" in labels_by_category else next(iter(labels_by_category.keys()), "Unknown")
+    return fallback, 0.50, ["Fallback default"]
+
+def score_linkage(region_used: str, vertical_overlap_ratio: float, text_density: float, has_headings: bool, penalties: float):
+    base = {"narrow": 0.35, "wide": 0.20, "nearest": 0.10}.get(region_used, 0.10)
+    s = base + min(0.25, 0.25 * vertical_overlap_ratio) + min(0.15, 0.15 * text_density)
+    if has_headings:
+        s += 0.15
+    s = max(0.0, min(1.0, s - penalties))
+    return s
 
 def page_text_raw(page) -> str:
     return page.get_text("text") or ""
@@ -257,33 +539,64 @@ def right_text_for_image(page, img_bbox: fitz.Rect, y_pad: float = 6.0, x_pad: f
 
 def parse_structured_fields(right_text: str) -> Dict[str, str]:
     """
-    Pulls Observation/Discussion/Description/etc. values out of the right text.
-    Returns a dict of lowercase field -> value (trimmed).
+    Pull Observation/Discussion/... values out of the right text.
+    Stops at the next recognized heading (Observation/Discussion/Recommendation/...),
+    including Cause/Effect and Photograph lines.
     """
     out = {}
     if not right_text:
         return out
-    # Normalize dashes for simpler matching
+
+    # Normalize common punctuation so we match "Observation – X" / "Observation — X"
     t = right_text.replace("—", "-").replace("–", "-")
-    # Extract each field value as 'this until next field header'
-    for fld in FIELD_TOKENS:
-        rx = re.compile(rf"(?is)\b{re.escape(fld)}s?\b\s*[:\-]\s*(.+?)(?=\b({'|'.join(FIELD_TOKENS)})\b\s*[:\-]|$)")
+
+    # Precompile a single "next heading" lookahead that covers all headings
+    # e.g., (?=\b(Observation|Observations|Discussion|...|Cause/Effect|Photograph)\b\s*[:\-]|$)
+    headings_rx = r"(?:{})".format("|".join(re.escape(h) for h in FIELD_TOKENS))
+    next_heading_lookahead = rf"(?=\b{headings_rx}\b\s*[:\-]|$)"
+
+    def grab(name: str):
+        # Allow both singular/plural by adding 's?' only when the base is singular
+        base = name
+        if name.lower().endswith("s"):
+            name_rx = re.escape(name)
+        else:
+            name_rx = re.escape(name) + "s?"
+        rx = re.compile(rf"(?is)\b{name_rx}\b\s*[:\-]\s*(.+?){next_heading_lookahead}")
         m = rx.search(t)
-        if m:
-            out[fld.lower()] = m.group(1).strip()
+        return m.group(1).strip() if m else None
+
+    # Try the important ones first
+    out["observation"] = grab("Observation") or grab("Observations")
+    out["discussion"]  = grab("Discussion") or grab("Description")
+    out["recommendation"] = grab("Recommendation")
+
+    # Keep the raw (unchanged) for auditing
+    out["_raw"] = right_text.strip()
     return out
 
 def derive_label_and_flags(right_text: str) -> Dict:
     """
-    Rule-set:
-    - If Observation exists -> label = its value.
-    - If Observation == 'Other' -> flag; include Discussion/Description as context.
-    - If no Observation -> label=None; flag; include all right text for manual.
+    - Primary: Observation field from structured headings.
+    - Fallback: First section from parse_panel_sections().
+    - Flags 'Other' or missing observation.
     """
     fields = parse_structured_fields(right_text)
-    obs = (fields.get("observation") or fields.get("observations") or "").strip()
+    obs = (fields.get("observation") or "").strip()
+
+    # Fallback: split panel into Observation/Discussion/Recommendation by headings on lines
+    if not obs:
+        fallback = parse_panel_sections(right_text or "")
+        obs = (fallback.get("observation") or "").strip()
+
+    # Strip a leading "Photograph ..." line if it slipped into obs
+    if obs:
+        obs_lines = [ln for ln in obs.splitlines() if ln.strip()]
+        if obs_lines and re.match(r"(?i)^\s*photograph\b", obs_lines[0]):
+            obs = "\n".join(obs_lines[1:]).strip()
+
     disc = fields.get("discussion") or ""
-    desc = fields.get("description") or ""
+    desc = ""  # description already covered by discussion in parse_structured_fields
 
     label = obs if obs else None
     flagged = False
@@ -296,7 +609,6 @@ def derive_label_and_flags(right_text: str) -> Dict:
         flagged = True
         label_source = "observation=other"
 
-    # Try to capture photo id if present in the block (useful for manual review)
     m = PHOTO_ID_RX.search(right_text or "")
     photo_id = m.group(1).strip() if m else None
 
@@ -305,7 +617,7 @@ def derive_label_and_flags(right_text: str) -> Dict:
         "label_source": label_source,
         "flagged": bool(flagged),
         "discussion_or_description": aux.strip(),
-        "raw_right_text": right_text.strip(),
+        "raw_right_text": (right_text or "").strip(),
         "photo_id": photo_id
     }
 
@@ -700,29 +1012,35 @@ def bbox_in_keep_window(b: fitz.Rect) -> bool:
             KEEP_Y1_RANGE[0] < b.y1 < KEEP_Y1_RANGE[1])
 
 def extract_images_on_page(doc, page_idx: int, pdf_name: str) -> List[Dict]:
+    """
+    Extracts kept images + performs right-panel text capture, label parsing,
+    taxonomy matching, and confidence scoring (label + linkage).
+    """
     records = []
     page = doc[page_idx]
     page_rect = page.rect
+    page_w, page_h = page_rect.width, page_rect.height
 
     img_rects_xref = get_image_rects(page)
     kept = 0
+
     for bbox, xref in img_rects_xref:
         skip_reasons = []
         if is_header_or_footer(bbox, page_rect):
             skip_reasons.append("header/footer")
         if is_tiny_logo(bbox, page_rect):
             skip_reasons.append("tiny-logo")
+
+        # Hard bbox window filter (must fall within keep ranges)
+        if not bbox_in_keep_window(bbox):
+            skip_reasons.append("outside keep-window")
+
         if skip_reasons:
             if DEBUG_IMAGES:
                 print(f"      - skip image xref={xref} @ {tuple(bbox)} | {', '.join(skip_reasons)}")
             continue
 
-        # Hard bbox window filter (must fall within keep ranges)
-        if not bbox_in_keep_window(bbox):
-            if DEBUG_IMAGES:
-                print(f"      - skip image xref={xref} @ {tuple(bbox)} | outside keep-window {tuple(bbox)}")
-            continue
-
+        # Save image
         filename = f"{pdf_name}_page{page_idx+1}_img{kept+1}.png"
         filepath = os.path.join(IMAGES_DIR, filename)
         ok = save_pixmap_as_rgb(doc, xref, filepath)
@@ -735,31 +1053,143 @@ def extract_images_on_page(doc, page_idx: int, pdf_name: str) -> List[Dict]:
         if DEBUG_IMAGES:
             print(f"      + kept image xref={xref} -> {filename} @ {tuple(bbox)}")
 
-        # ---- NEW: grab the right-column text that belongs to THIS image
+        # ---------------- RIGHT-TEXT CAPTURE (anchored to image) ----------------
+        # Use existing regionizer; it already unions vertically-overlapping right-column blocks
         right = right_text_for_image(page, bbox)
-        fields = derive_label_and_flags(right.get("text", ""))
+        right_text = right.get("text", "") or ""
+        right_bbox = right.get("bbox")
+        right_blocks_used = right.get("blocks_used", 0)
 
+        # Preserve sentence newlines (we'll also re-clean in main dataframe step)
+        fields = derive_label_and_flags(right_text)
+
+        # ---------------- SECTION PRIOR (Update 3) ----------------
+        # pulled from per-page detection: set earlier via page.__dict__['_labeling_current_section']
+        current_section = getattr(page, "_labeling_current_section", None)  # e.g., "3.0" or None
+
+        # ---------------- TAXONOMY MATCHING (Update 4) ----------------
+        # Expect globals from helpers: taxonomy_by_canonical, labels_by_category, all_labels_canonical, LABELING_CFG
+        obs_raw = fields.get("label") or ""          # raw Observation text (may be "Other" or empty)
+        disc    = fields.get("discussion_or_description") or ""
+        label_source = fields.get("label_source", "none")
+
+        # 1) try to match the raw observation to canonical labels
+        obs_label, sim = match_label(
+            obs_raw,
+            taxonomy_by_canonical,
+            all_labels_canonical,
+            strict=LABELING_CFG["fuzzy_strict"],
+            loose=LABELING_CFG["fuzzy_loose"]
+        )
+
+        flag_review = bool(fields.get("flagged", False))
+        flag_reasons: List[str] = []
+
+        # If no match, try first line heuristic (no headings case)
+        if not obs_label and obs_raw:
+            first_line = obs_raw.splitlines()[0].strip()
+            obs_label2, sim2 = match_label(
+                first_line,
+                taxonomy_by_canonical,
+                all_labels_canonical,
+                strict=LABELING_CFG["fuzzy_strict"],
+                loose=LABELING_CFG["fuzzy_loose"]
+            )
+            if obs_label2:
+                obs_label, sim = obs_label2, max(sim, sim2)
+
+        # Category resolution (incl. "Other" disambiguation)
+        if not obs_label:
+            # Unresolved → route to category's "Other" using priors
+            cat, cat_conf, reasons = infer_category_for_other(right_text, page_text_raw(page), current_section, labels_by_category)
+            obs_label = "Other"
+            obs_category = cat
+            confidence_label = min(0.65, cat_conf)  # conservative
+            flag_review = True
+            flag_reasons += ["Unresolved observation → routed to category 'Other'"] + reasons
+        else:
+            # Found canonical label; get its category
+            can = _canon(obs_label)
+            obs_category = taxonomy_by_canonical[can]["category"]
+            confidence_label = sim
+            if obs_label.lower() == "other":
+                cat, cat_conf, reasons = infer_category_for_other(right_text, page_text_raw(page), current_section, labels_by_category)
+                obs_category = cat
+                confidence_label = min(confidence_label, cat_conf)
+                flag_reasons += ["Label 'Other' → disambiguated category"] + reasons
+
+        # ---------------- LINKAGE CONFIDENCE (image ↔ right-panel) ----------------
+        # Use vertical overlap and text density as signals; penalize header/footer proximity and thin panels.
+        if right_bbox is not None:
+            # Build a faux "panel_lines" height using the bbox (we don't have line bboxes here)
+            p_top, p_bot = right_bbox.y0, right_bbox.y1
+        else:
+            # If no bbox returned, approximate from the image and page bounds
+            p_top, p_bot = max(bbox.y0, 0), min(bbox.y1, page_h)
+
+        iy0, iy1 = bbox.y0, bbox.y1
+        vo = max(0, min(iy1, p_bot) - max(iy0, p_top))
+        vh = max(1, (iy1 - iy0))
+        vertical_overlap_ratio = vo / vh
+
+        # crude density proxy: how many right blocks we merged (0..1 normalized)
+        text_density = 0.0
+        if isinstance(right_blocks_used, int) and right_blocks_used > 0:
+            text_density = min(1.0, right_blocks_used / 6.0)
+
+        penalties = 0.0
+        if p_top < LABELING_CFG["header_ymax"]:
+            penalties += 0.15
+        if (page_h - p_bot) < LABELING_CFG["footer_ymin_from_bottom"]:
+            penalties += 0.15
+        if right_bbox is not None and (right_bbox.x1 - right_bbox.x0) < LABELING_CFG["min_panel_width"]:
+            penalties += 0.10
+
+        # We don't know if we used "narrow/wide/nearest" here; use "nearest" if no bbox else "narrow"
+        region_used = "narrow" if right_bbox is not None else "nearest"
+        has_headings = bool(OBS_REGEX.search(right_text) or DISC_REGEX.search(right_text) or RECO_REGEX.search(right_text))
+        confidence_linkage = score_linkage(region_used, vertical_overlap_ratio, text_density, has_headings, penalties)
+        if confidence_linkage < 0.35:
+            flag_review = True
+            flag_reasons.append(f"Low linkage confidence ({confidence_linkage:.2f})")
+
+        # ---------------- RECORD ----------------
         rec = {
             "report_id": pdf_name,
             "page": page_idx + 1,
             "image_index": kept,
             "image_file": filename,
-            "bbox": tuple(bbox),
-            "page_width": page.rect.width,
-            "page_height": page.rect.height,
 
-            # label fields:
-            "label": fields["label"],
-            "label_source": fields["label_source"],          # 'observation', 'observation=other', or 'none'
-            "flagged_for_manual": fields["flagged"],         # True if 'Other' or no Observation found
-            "discussion_or_description": fields["discussion_or_description"],  # filled when Other or for context
-            "right_text_bbox": tuple(right["bbox"]) if right["bbox"] else None,
-            "right_text_blocks_used": right.get("blocks_used", 0),
-            "right_text_raw": fields["raw_right_text"],
-            "photo_id": fields["photo_id"],
+            # image bbox + page dims
+            "bbox": tuple(bbox),
+            "page_width": page_w,
+            "page_height": page_h,
+
+            # right text capture
+            "right_text_bbox": tuple(right_bbox) if right_bbox else None,
+            "right_text_blocks_used": right_blocks_used,
+            "right_text_raw": fields.get("raw_right_text", right_text).strip(),
+
+            # parsed fields (for audit)
+            "observation_raw": obs_raw,
+            "discussion_or_description": disc,
+            "label_source": label_source,   # 'observation', 'observation=other', or 'none'
+            "photo_id": fields.get("photo_id"),
+
+            # final labeling (normalized)
+            "observation_label": obs_label,         # canonical (or "Other")
+            "observation_category": obs_category,   # 1.0 .. 7.0 (or "Unknown")
+            "confidence_label": round(float(confidence_label), 3),
+            "confidence_linkage": round(float(confidence_linkage), 3),
+
+            # flags
+            "flag_review": bool(flag_review),
+            "flag_reason": "; ".join(flag_reasons),
+
+            # page-context prior
+            "section": current_section,   # e.g., "3.0"
         }
         records.append(rec)
-
     return records
 
 def extract_images_from_pdf(pdf_path: str) -> Tuple[List[Dict], int, Set[int]]:
@@ -773,6 +1203,7 @@ def extract_images_from_pdf(pdf_path: str) -> Tuple[List[Dict], int, Set[int]]:
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
     n_pages = len(doc)
 
+    # --- TOC / Appendix detection ---
     toc_range = find_toc_range(doc)
     appendix_from_toc = appendix_start_from_toc(doc, toc_range) if toc_range else None
     appendix_start = appendix_from_toc if appendix_from_toc is not None else fallback_find_appendix_start(doc)
@@ -795,7 +1226,16 @@ def extract_images_from_pdf(pdf_path: str) -> Tuple[List[Dict], int, Set[int]]:
 
     for i in range(n_pages):
         page = doc[i]
-        raw = page_text_raw(page)
+        raw  = page_text_raw(page)
+
+        # ===== LABELING: detect current 1.0–7.0 section on THIS PAGE =====
+        current_section = None
+        for ln in raw.splitlines():
+            m = SEC_REGEX.match(ln.strip())
+            if m:
+                current_section = f"{m.group(1)}.0"   # e.g., "3.0"
+        page.__dict__["_labeling_current_section"] = current_section
+        # =================================================================
 
         # --- DOMAIN: update on top heading
         d = classify_domain_top_heading(page)
@@ -824,18 +1264,21 @@ def extract_images_from_pdf(pdf_path: str) -> Tuple[List[Dict], int, Set[int]]:
             extras = extras + f", domain={domain_state}"
             print(f"Page {i+1:>3}: {msg}  | {extras}  | state={section_state}")
 
+        # Normal extraction path
         if do_process and img_count > 0:
             recs = extract_images_on_page(doc, i, pdf_name)
+
             # If in OBS and nothing kept (e.g., tiny/header-only), try fallback render
             if OBS_FALLBACK and len(recs) == 0 and section_state == 'OBS' and domain_state == 'ROOF':
                 fb = render_left_column_fallback(page, pdf_name, i)
                 if fb:
                     recs = [fb]
+
             if recs:
                 pages_used.add(i + 1)
-            records.extend(recs)
+                records.extend(recs)
 
-        # OBS fallback even if geometry failed / no XObjects
+        # OBS fallback even if geometry failed / no XObjects (only when explicitly enabled)
         if OBS_FALLBACK and (not do_process) and section_state == 'OBS' and domain_state == 'ROOF':
             if "layout-not-left-img_right-text" in reasons or "no images" in reasons:
                 fb = render_left_column_fallback(page, pdf_name, i)
@@ -843,7 +1286,7 @@ def extract_images_from_pdf(pdf_path: str) -> Tuple[List[Dict], int, Set[int]]:
                     records.append(fb)
                     pages_used.add(i + 1)
 
-    # Conservative overall fallback window (domain-aware) – disabled when OBS_FALLBACK=False
+    # Conservative overall fallback window (domain-aware) – runs only if nothing was extracted
     if OBS_FALLBACK and len(records) == 0:
         if DEBUG_SUMMARY:
             print(f"⚠️  {pdf_name}: No images after gating. Running fallback window...")
@@ -853,14 +1296,16 @@ def extract_images_from_pdf(pdf_path: str) -> Tuple[List[Dict], int, Set[int]]:
         domain_state = 'OTHER'
         for i in range(start_i, max(start_i, end_limit)):
             page = doc[i]
-            raw = page_text_raw(page)
+            raw  = page_text_raw(page)
 
+            # refresh domain
             d = classify_domain_top_heading(page)
             if d in ('ROOF', 'BUILDING'):
                 domain_state = d
             if domain_state != 'ROOF':
                 continue
 
+            # refresh section (OBS/NONE) using heading classifier
             cls, _ = classify_top_heading(page)
             if cls == 'BLOCK':
                 section_state = 'NONE'
@@ -936,7 +1381,7 @@ def _safe_int(x):
     except Exception:
         return 0
 
-def load_previous_run(path: str) -> Optional[dict]:
+def previous_run(path: str) -> Optional[dict]:
     """Return dict with 'reports' and 'totals', or None if not present/invalid."""
     if not os.path.exists(path):
         return None
@@ -1087,6 +1532,13 @@ def main():
 
     # Load last snapshot (for diff at the end)
     last = _load_last_snapshot()
+
+    # ---- Load labeling taxonomy from JSON (not Excel) ----
+    global taxonomy_by_canonical, labels_by_category, all_labels_canonical
+    taxonomy_by_canonical, labels_by_category, all_labels_canonical = load_labels_from_json(LABELS_JSON)
+    if DEBUG_SUMMARY:
+        print(f"Loaded {len(all_labels_canonical)} labels from JSON: {LABELS_JSON}")
+
 
     for pdf in pdf_files:
         total_docs += 1

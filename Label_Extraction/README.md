@@ -1,0 +1,1 @@
+This code is responsible for taking FORSMITH's roofing issue identification excel sheet and formatting it as a structured JSON for the dataset creation code to match images to labels.
