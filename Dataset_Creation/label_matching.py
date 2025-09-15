@@ -1,6 +1,16 @@
 # ------------------------------------------------------------
 # Label taxonomy loading + observation parsing + fuzzy match
 # Encapsulated in LabelMatcher for clean use by image_extraction.
+#
+# Updates:
+# - _normalize_raw_text(): fixes 'â€“' -> '-', normalizes dashes,
+#   and collapses stray newlines (only keep newline if previous
+#   non-whitespace char is a period '.').
+# - Normalization is applied consistently in:
+#   * parse_structured_fields()
+#   * parse_panel_sections()
+#   * LabelMatcher._derive_label_and_flags()
+#   * LabelMatcher.compute_label() (for heuristics/has_headings)
 # ------------------------------------------------------------
 
 from typing import Dict, Tuple, Set, Optional, List
@@ -25,6 +35,47 @@ def _normalize_cat_key(cat_raw: str) -> str:
     if m:
         return f"{m.group(1)}.0"
     return s
+
+# ---------------- Text normalization for raw panels ----------------
+def _normalize_raw_text(s: str) -> str:
+    """
+    Fix mojibake and collapse newlines to improve readability and parsing:
+
+      - Replace 'â€“' with '-' (mojibake)
+      - Also normalize real en/em dashes to '-' for consistency
+      - Keep a newline ONLY if the last non-whitespace character
+        immediately before it is a period '.'. Otherwise, replace
+        newline with a single space.
+    """
+    if not s:
+        return ""
+    t = str(s).replace("\r\n", "\n").replace("\r", "\n")
+
+    # Fix dash variants
+    t = t.replace("â€“", "-")
+    t = t.replace("–", "-").replace("—", "-")
+
+    out = []
+    last_non_ws = None
+    for ch in t:
+        if ch == "\n":
+            if last_non_ws == ".":
+                out.append("\n")
+            else:
+                out.append(" ")
+        else:
+            out.append(ch)
+            if not ch.isspace():
+                last_non_ws = ch
+
+    joined = "".join(out)
+
+    # Collapse multiple spaces that might have been introduced
+    joined = re.sub(r"[ \t]{2,}", " ", joined)
+
+    # Trim trailing spaces per line, keep intentional newlines after periods
+    joined = "\n".join(line.rstrip() for line in joined.split("\n")).strip()
+    return joined
 
 # ---------------- Load labels JSON ----------------
 def load_labels_from_json(json_path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Set[str]], Set[str]]:
@@ -78,7 +129,10 @@ def parse_structured_fields(right_text: str) -> Dict[str, str]:
     out = {}
     if not right_text:
         return out
-    t = right_text.replace("—", "-").replace("–", "-")
+
+    # CLEAN FIRST so heading-based parsing sees a single, tidy paragraph
+    t = _normalize_raw_text(right_text)
+
     headings_rx = r"(?:{})".format("|".join(re.escape(h) for h in FIELD_TOKENS))
     next_heading_lookahead = rf"(?=\b{headings_rx}\b\s*[:\-]|$)"
 
@@ -93,10 +147,12 @@ def parse_structured_fields(right_text: str) -> Dict[str, str]:
     out["observation"] = grab("Observation") or grab("Observations")
     out["discussion"]  = grab("Discussion") or grab("Description")
     out["recommendation"] = grab("Recommendation")
-    out["_raw"] = right_text.strip()
+    out["_raw"] = t.strip()
     return out
 
 def parse_panel_sections(text: str):
+    # CLEAN FIRST so the fallback panel segmentation uses normalized lines
+    text = _normalize_raw_text(text or "")
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     current = None
     buckets = {"observation": [], "discussion": [], "recommendation": []}
@@ -207,10 +263,15 @@ class LabelMatcher:
 
     @staticmethod
     def _derive_label_and_flags(right_text: str) -> Dict:
-        fields = parse_structured_fields(right_text)
+        # CLEAN FIRST so everything downstream sees normalized text
+        cleaned = _normalize_raw_text(right_text or "")
+
+        # Use cleaned text in the structured parser
+        fields = parse_structured_fields(cleaned)
+
         obs = (fields.get("observation") or "").strip()
         if not obs:
-            fallback = parse_panel_sections(right_text or "")
+            fallback = parse_panel_sections(cleaned or "")
             obs = (fallback.get("observation") or "").strip()
         if obs:
             obs_lines = [ln for ln in obs.splitlines() if ln.strip()]
@@ -227,7 +288,7 @@ class LabelMatcher:
             flagged = True
             label_source = "observation=other"
 
-        m = PHOTO_ID_RX.search(right_text or "")
+        m = PHOTO_ID_RX.search(cleaned or "")
         photo_id = m.group(1).strip() if m else None
 
         return {
@@ -235,7 +296,7 @@ class LabelMatcher:
             "label_source": label_source,
             "flagged": bool(flagged),
             "discussion_or_description": (disc or "").strip(),
-            "raw_right_text": (right_text or "").strip(),
+            "raw_right_text": cleaned,   # << store CLEANED text here
             "photo_id": photo_id
         }
 
@@ -266,8 +327,10 @@ class LabelMatcher:
         flag_review = bool(fields.get("flagged", False))
         flag_reasons: List[str] = []
 
+        # Use cleaned text for category inference and heading detection
+        cleaned_text = fields.get("raw_right_text", right_text or "")
         if not obs_label:
-            cat, cat_conf, reasons = infer_category_for_other(right_text, page_text, current_section, self.labels_by_category)
+            cat, cat_conf, reasons = infer_category_for_other(cleaned_text, page_text, current_section, self.labels_by_category)
             obs_label = "Other"
             obs_category = cat
             confidence_label = min(0.65, cat_conf)
@@ -278,7 +341,7 @@ class LabelMatcher:
             obs_category = self.taxonomy_by_canonical[can]["category"]
             confidence_label = sim
             if obs_label.lower() == "other":
-                cat, cat_conf, reasons = infer_category_for_other(right_text, page_text, current_section, self.labels_by_category)
+                cat, cat_conf, reasons = infer_category_for_other(cleaned_text, page_text, current_section, self.labels_by_category)
                 obs_category = cat
                 confidence_label = min(confidence_label, cat_conf)
                 flag_reasons += ["Label 'Other' → disambiguated category"] + reasons
@@ -296,7 +359,7 @@ class LabelMatcher:
         vh = max(1, (iy1 - iy0))
         vertical_overlap_ratio = vo / vh
 
-        text_density = 0.0  # caller can pass blocks_used if needed; neutral default here
+        text_density = 0.0  # neutral default; could be augmented with blocks_used
 
         penalties = 0.0
         if p_top < self.cfg.get("header_ymax", 90):
@@ -306,7 +369,12 @@ class LabelMatcher:
         if right_bbox is not None and (right_bbox.x1 - right_bbox.x0) < self.cfg.get("min_panel_width", 80):
             penalties += 0.10
 
-        has_headings = bool(OBS_REGEX.search(right_text or "") or DISC_REGEX.search(right_text or "") or RECO_REGEX.search(right_text or ""))
+        has_headings = bool(
+            OBS_REGEX.search(cleaned_text or "") or
+            DISC_REGEX.search(cleaned_text or "") or
+            RECO_REGEX.search(cleaned_text or "")
+        )
+
         confidence_linkage = score_linkage(region_used, vertical_overlap_ratio, text_density, has_headings, penalties)
         if confidence_linkage < 0.35:
             flag_review = True

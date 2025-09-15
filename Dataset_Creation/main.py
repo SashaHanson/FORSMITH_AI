@@ -4,6 +4,7 @@
 # - Iterates PDFs, calls image_extraction with LabelMatcher
 # - Builds DataFrame and writes CSV
 # - Saves run snapshot & prints diff vs previous run
+# - Prints end-of-run SUMMARY and per-report table
 # ------------------------------------------------------------
 
 import os, glob, re, json, datetime
@@ -186,7 +187,6 @@ def main():
     prior_snapshot_txt = _history_path()
     last_snapshot_compact = {}
     if os.path.exists(prior_snapshot_txt):
-        # build 'prev' payload compatible with diff_and_print
         last_lines = open(prior_snapshot_txt, "r", encoding="utf-8").read().splitlines()
         prev_reports = {}
         totals = {}
@@ -236,7 +236,38 @@ def main():
         df["rtdx"] = df["rtx1"] - df["rtx0"]
         df["rtdy"] = df["rty1"] - df["rty0"]
 
-    csv_path = safe_write_csv_with_retry(df, CSV_OUTPUT)
+    csv_path = safe_write_csv_with_retry(df, CSV_OUTPUT) # Write CSV
+
+    # ======== YOUR REQUESTED SUMMARY OUTPUT ========
+    print("\n================ SUMMARY ================")
+    print(f"Processed reports : {total_docs}")
+    print(f"Total images      : {len(all_records)}")
+    print(f"Images folder     : {IMAGES_DIR}")
+    print(f"Metadata CSV      : {csv_path}")
+    print("=========================================")
+
+    # --- Per-report table (Total pages, Pages with images, Total images) ---
+    if per_report_stats:
+        rows = []
+        for rid, stats in per_report_stats.items():
+            rows.append({
+                "report_id": rid,
+                "total_pages": stats["total_pages"],
+                "pages_with_images": stats["pages_used"],
+                "image_count": stats["images"],
+            })
+        tdf = pd.DataFrame(rows)
+        tdf = tdf.sort_values(by="report_id", key=lambda col: col.map(sort_key_report_id))
+
+        print("\n============= PER-REPORT EXTRACTION SUMMARY =============")
+        print(f"{'Report ID':<20} {'Pages':>7} {'Pages Used':>12} {'Images':>8}")
+        print("-" * 55)
+        for _, r in tdf.iterrows():
+            print(f"{r['report_id']:<20} {int(r['total_pages']):>7} {int(r['pages_with_images']):>12} | {int(r['image_count']):>8}")
+        print("=========================================================")
+    else:
+        print("\n(no reports processed)")
+    # ======== END SUMMARY OUTPUT ========
 
     # Build a compact JSON summary (for human diff)
     curr_summary = {
@@ -258,7 +289,6 @@ def main():
         total_docs=len(per_report_stats),
         total_images=int(df.shape[0]) if not df.empty else 0
     )
-
     print("\nDone.")
 
 if __name__ == "__main__":

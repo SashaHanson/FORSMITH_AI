@@ -123,10 +123,8 @@ def get_text_blocks(page):
     try:
         for b in page.get_text("blocks") or []:
             if len(b) >= 7 and b[6] == 0 and isinstance(b[4], str):
-                import fitz
                 blocks.append((fitz.Rect(b[0], b[1], b[2], b[3]), b[4]))
             elif len(b) >= 5 and isinstance(b[4], str):
-                import fitz
                 blocks.append((fitz.Rect(b[0], b[1], b[2], b[3]), b[4]))
     except Exception:
         pass
