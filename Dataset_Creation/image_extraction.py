@@ -99,7 +99,7 @@ APPENDIX_HEADING_START = r"(?mi)^\s*appendix(?:\s+[A-Z0-9]+)?\b"
 
 SEC_REGEX  = re.compile(r"^\s*([1-7])\.(\d+)\s+(.+)$")   # e.g., 3.0 Roof Penetrations
 
-# ---------- Debug toggles (kept for parity; caller can set) ----------
+# ---------- Debug toggles ----------
 DEBUG_TOC     = True
 DEBUG_PAGES   = True
 DEBUG_SUMMARY = True
@@ -143,6 +143,7 @@ def get_image_rects(page):
     return rects
 
 def cluster_rects(rects: List[fitz.Rect]) -> Optional[fitz.Rect]:
+    """Union all rects; return None if empty."""
     if not rects:
         return None
     r = fitz.Rect(rects[0])
@@ -561,20 +562,29 @@ def extract_images_on_page(doc, page_idx: int, pdf_name: str, images_dir: str, m
 
             "right_text_bbox": tuple(right_bbox) if right_bbox else None,
             "right_text_blocks_used": right_blocks_used,
-            "right_text_raw": label_info["raw_right_text"],
+            "right_text_raw": label_info["right_text_raw"],
 
             "observation_raw": label_info["observation_raw"],
             "discussion_or_description": label_info["discussion_or_description"],
             "label_source": label_info["label_source"],
-            "photo_id": label_info["photo_id"],
+            "photo_id": label_info["photo_id"] if "photo_id" in label_info else None,
 
             "observation_label": label_info["observation_label"],
-            "observation_category": label_info["observation_category"],
+            "observation_id": label_info["observation_id"],
             "confidence_label": label_info["confidence_label"],
             "confidence_linkage": label_info["confidence_linkage"],
 
             "flag_review": label_info["flag_review"],
             "flag_reason": label_info["flag_reason"],
+
+            # NEW: lightweight labeler provenance + alternates
+            "label_method": label_info.get("label_method"),
+            "label_method_info": label_info.get("label_method_info"),
+            "alt1_label": label_info.get("alt1_label"),
+            "alt1_score": label_info.get("alt1_score"),
+            "alt2_label": label_info.get("alt2_label"),
+            "alt2_score": label_info.get("alt2_score"),
+
             "section": current_section,
         }
         records.append(rec)

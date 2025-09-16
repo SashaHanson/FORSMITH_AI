@@ -2,25 +2,42 @@
 # Label taxonomy loading + observation parsing + fuzzy match
 # Encapsulated in LabelMatcher for clean use by image_extraction.
 #
-# Updates:
-# - _normalize_raw_text(): fixes 'â€“' -> '-', normalizes dashes,
-#   and collapses stray newlines (only keep newline if previous
-#   non-whitespace char is a period '.').
-# - Normalization is applied consistently in:
-#   * parse_structured_fields()
-#   * parse_panel_sections()
-#   * LabelMatcher._derive_label_and_flags()
-#   * LabelMatcher.compute_label() (for heuristics/has_headings)
+# Behavior per spec:
+# - observation_raw is empty when no explicit Observation section is found.
+# - When no explicit Observation is found, label_source="full text" and the
+#   entire cleaned right_text_raw is used for matching/review.
+# - discussion_or_description is suppressed (empty string).
+# - label_source is only "observation" or "full text" (no "none").
+# - observation_category -> observation_id:
+#     * If a specific label is matched, emit its JSON id (e.g., 6.01.05).
+#     * If only a sheet is inferred, emit the sheet title string (e.g., "6.0 - Shingle").
+#     * If the best is "Other" within a sheet, emit that sheet's "Other" id (e.g., 7.09.01) when available.
+# - right_text_raw is normalized: fix 'â€“' -> '-', normalize dashes, and
+#   collapse mid-sentence newlines (keep newline only after '.').
+#
+# Matching:
+# - Load ALL label items (no collapsing by label text).
+# - Fuzzy match against distinct items with a small bias to the current sheet.
+#
+# Back-compat:
+# - load_labels_from_json(json_path, extended=False) returns the original 3-tuple
+#   (taxonomy_by_canonical, labels_by_category, all_labels_canonical).
+# - If extended=True, returns the 7-tuple (..., other_id_by_sheet, sheet_title_by_key,
+#   total_labels, label_items). main.py uses extended=True.
+# - LabelMatcher __init__ accepts label_items (full distinct rows).
+# - Returned dict also includes "raw_right_text" and "observation_category" shims.
 # ------------------------------------------------------------
 
 from typing import Dict, Tuple, Set, Optional, List
 from pathlib import Path
 from collections import defaultdict
 import json, re
+from label_inference import LightInferencer, DEFAULT_RULES
+
 try:
-    from rapidfuzz import fuzz
-except:
-    fuzz = None
+    from rapidfuzz import fuzz as _rf_fuzz
+except Exception:
+    _rf_fuzz = None
 
 # ---------------- Canonicalization helpers ----------------
 def _canon(s: str) -> str:
@@ -77,8 +94,14 @@ def _normalize_raw_text(s: str) -> str:
     joined = "\n".join(line.rstrip() for line in joined.split("\n")).strip()
     return joined
 
-# ---------------- Load labels JSON ----------------
-def load_labels_from_json(json_path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Set[str]], Set[str]]:
+# ---------------- Load labels JSON (no collapsing by text) ----------------
+# We build:
+# - label_items:        list of distinct items [{label,id,sheet_key,sheet_title,canon}, ...]
+# - labels_by_category: sheet_key -> set(canon label strings)  (for priors/inference only)
+# - other_id_by_sheet:  sheet_key -> the 'Other' id if present
+# - sheet_title_by_key: sheet_key -> original sheet title (e.g., "6.0 - Shingle")
+# Also synthesize a minimal taxonomy_by_canonical for back-compat APIs.
+def load_labels_from_json(json_path, *, extended: bool = False):
     p = Path(json_path)
     if not p.exists():
         raise FileNotFoundError(f"Labels JSON not found: {p}")
@@ -93,8 +116,12 @@ def load_labels_from_json(json_path) -> Tuple[Dict[str, Dict[str, str]], Dict[st
     else:
         raise ValueError("Unexpected labels JSON structure: expected dict with 'items' or a list.")
 
-    taxonomy_by_canonical: Dict[str, Dict[str, str]] = {}
+    total_labels = len(items)
+
+    label_items: List[dict] = []
     labels_by_category: Dict[str, Set[str]] = defaultdict(set)
+    other_id_by_sheet: Dict[str, str] = {}
+    sheet_title_by_key: Dict[str, str] = {}
 
     for item in items:
         if not isinstance(item, dict):
@@ -102,15 +129,56 @@ def load_labels_from_json(json_path) -> Tuple[Dict[str, Dict[str, str]], Dict[st
         lab = str(item.get("label", "")).strip()
         if not lab:
             continue
-        cat_raw = str(item.get("sheet", item.get("category", ""))).strip()
-        cat_key = _normalize_cat_key(cat_raw)
+        lab_id = str(item.get("id", "")).strip()  # e.g., "6.01.05"
+        sheet_title = str(item.get("sheet", item.get("category", ""))).strip()  # e.g., "6.0 - Shingle"
+        sheet_key = _normalize_cat_key(sheet_title)
         can = _canon(lab)
-        taxonomy_by_canonical[can] = {"label": lab, "category": cat_key}
-        if cat_key:
-            labels_by_category[cat_key].add(can)
 
+        label_items.append({
+            "label": lab,
+            "id": lab_id,
+            "sheet_key": sheet_key,
+            "sheet_title": sheet_title,
+            "canon": can,
+        })
+
+        if sheet_key:
+            labels_by_category[sheet_key].add(can)
+            sheet_title_by_key[sheet_key] = sheet_title
+
+        if can == "other" and lab_id:
+            other_id_by_sheet[sheet_key] = lab_id
+
+    # For backward compatibility with callers expecting:
+    # (taxonomy_by_canonical, labels_by_category, all_labels_canonical)
+    taxonomy_by_canonical: Dict[str, Dict[str, str]] = {}
+    for li in label_items:
+        can = li["canon"]
+        if can not in taxonomy_by_canonical:
+            taxonomy_by_canonical[can] = {
+                "label": li["label"],
+                "id": li["id"],
+                "sheet_key": li["sheet_key"],
+                "sheet_title": li["sheet_title"],
+            }
     all_labels_canonical = set(taxonomy_by_canonical.keys())
-    return taxonomy_by_canonical, labels_by_category, all_labels_canonical
+
+    if extended:
+        return (
+            taxonomy_by_canonical,
+            labels_by_category,
+            all_labels_canonical,
+            other_id_by_sheet,
+            sheet_title_by_key,
+            total_labels,
+            label_items,  # distinct rows; use this for matching
+        )
+    else:
+        return (
+            taxonomy_by_canonical,
+            labels_by_category,
+            all_labels_canonical,
+        )
 
 # ---------------- Parsing structured fields ----------------
 FIELD_TOKENS = [
@@ -145,58 +213,53 @@ def parse_structured_fields(right_text: str) -> Dict[str, str]:
         m = rx.search(t);  return m.group(1).strip() if m else None
 
     out["observation"] = grab("Observation") or grab("Observations")
-    out["discussion"]  = grab("Discussion") or grab("Description")
-    out["recommendation"] = grab("Recommendation")
+    # We intentionally do NOT emit discussion/description anymore (suppressed downstream)
     out["_raw"] = t.strip()
     return out
 
 def parse_panel_sections(text: str):
-    # CLEAN FIRST so the fallback panel segmentation uses normalized lines
+    # CLEAN FIRST so the fallback uses normalized lines
     text = _normalize_raw_text(text or "")
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    current = None
-    buckets = {"observation": [], "discussion": [], "recommendation": []}
-    for l in lines:
-        if OBS_REGEX.match(l):
-            current = "observation"; continue
-        if DISC_REGEX.match(l):
-            current = "discussion"; continue
-        if RECO_REGEX.match(l):
-            current = "recommendation"; continue
-        if current:
-            buckets[current].append(l)
-        else:
-            if not buckets["observation"]:
-                buckets["observation"].append(l)
-            else:
-                buckets["discussion"].append(l)
-    return {k: ("\n".join(v).strip() if v else None) for k, v in buckets.items()}
+    # Minimalistic fallback: if no headings, treat first non-empty line(s) as observation text candidate
+    if not lines:
+        return {"observation": None}
+    return {"observation": "\n".join(lines).strip()}
 
-# ---------------- Matching + inference ----------------
-def token_set_ratio(a: str, b: str) -> float:
+# ---------------- Matching against DISTINCT items ----------------
+def _token_set_ratio(a: str, b: str) -> float:
     A = set(_canon(a).split())
     B = set(_canon(b).split())
     if not A or not B:
         return 0.0
     return len(A & B) / len(A | B)
 
-def match_label_text(obs_text: str, taxonomy_by_canonical, all_labels_canonical, strict=0.90, loose=0.80):
-    if not obs_text:
+def _match_label_item(text: str,
+                      label_items: List[dict],
+                      sheet_hint: Optional[str],
+                      strict: float = 0.90,
+                      loose: float = 0.80):
+    """Return (best_item_or_None, best_score) by fuzzy match, with a small bonus for matching the current sheet."""
+    if not text:
         return None, 0.0
-    c = _canon(obs_text)
-    if c in all_labels_canonical:
-        lab = taxonomy_by_canonical[c]["label"]
-        return lab, 1.0
-    best_lab, best_score = None, -1.0
-    for can in all_labels_canonical:
-        cand_lab = taxonomy_by_canonical[can]["label"]
-        score = (fuzz.token_set_ratio(c, can) / 100.0) if fuzz else token_set_ratio(c, can)
-        if score > best_score:
-            best_score, best_lab = score, cand_lab
+
+    C = _canon(text)
+    if not C:
+        return None, 0.0
+
+    best_item, best_score = None, -1.0
+    for it in label_items:
+        base = (_rf_fuzz.token_set_ratio(C, it["canon"]) / 100.0) if _rf_fuzz else _token_set_ratio(C, it["canon"])
+        # small, safe bias toward the current sheet (if known)
+        if sheet_hint and it.get("sheet_key") == sheet_hint:
+            base += 0.03
+        if base > best_score:
+            best_score, best_item = base, it
+
     if best_score >= strict:
-        return best_lab, best_score
+        return best_item, best_score
     if best_score >= loose:
-        return best_lab, best_score
+        return best_item, best_score
     return None, best_score
 
 KW_PRIORS = {
@@ -204,13 +267,15 @@ KW_PRIORS = {
     "3.0": ["debris","vegetation","organic","algae","stain","surface","fines","gravel","granule"],
     "4.0": ["parapet","coping","counterflashing","edge metal","termination bar","curb","wall"],
     "5.0": ["drain","scupper","gutter","leader","downspout","overflow","ponding","sump"],
-    "6.0": ["penetration","pipe","vent","stack","conduit","pitch pocket","equipment","flashing"],
-    "7.0": ["safety","guardrail","access","ladder","fall","tie-off","hatch"],
+    "6.0": ["penetration","pipe","vent","stack","conduit","pitch pocket","equipment","flashing","shingle","tile"],
+    "7.0": ["safety","guardrail","access","ladder","fall","tie-off","hatch","metal"],
     "1.0": ["general","deck","structure","insulation","moisture","wet","slope","taper","thermal"],
 }
 SEC_REGEX  = re.compile(r"^\s*([1-7])\.(\d+)\s+(.+)$")
 
-def infer_category_for_other(panel_text: str, page_text_above: str, current_section: str, labels_by_category):
+def infer_sheet_title(panel_text: str, page_text_above: str, current_section: str,
+                      labels_by_category, sheet_title_by_key) -> Tuple[str, float, List[str]]:
+    """Return (sheet_key, confidence, reasons)."""
     reasons = []
     if current_section and current_section in labels_by_category:
         reasons.append(f"Section prior {current_section}")
@@ -236,8 +301,12 @@ def infer_category_for_other(panel_text: str, page_text_above: str, current_sect
             reasons.append(f"Keyword prior {best} (hits={scores[best]})")
             return best, 0.60 + min(0.2, 0.05 * scores[best]), reasons
 
-    fallback = "1.0" if "1.0" in labels_by_category else next(iter(labels_by_category.keys()), "Unknown")
-    return fallback, 0.50, ["Fallback default"]
+    # Fallback to any known sheet (stable, lowest confidence)
+    if sheet_title_by_key:
+        any_key = next(iter(sheet_title_by_key.keys()))
+        return any_key, 0.50, ["Fallback default"]
+
+    return "Unknown", 0.40, ["No sheet context"]
 
 def score_linkage(region_used: str, vertical_overlap_ratio: float, text_density: float, has_headings: bool, penalties: float):
     base = {"narrow": 0.35, "wide": 0.20, "nearest": 0.10}.get(region_used, 0.10)
@@ -249,10 +318,21 @@ def score_linkage(region_used: str, vertical_overlap_ratio: float, text_density:
 
 # ---------------- LabelMatcher ----------------
 class LabelMatcher:
-    def __init__(self, taxonomy_by_canonical, labels_by_category, all_labels_canonical, cfg=None):
+    def __init__(self,
+                 taxonomy_by_canonical,
+                 labels_by_category,
+                 all_labels_canonical,
+                 other_id_by_sheet: Optional[Dict[str, str]] = None,
+                 sheet_title_by_key: Optional[Dict[str, str]] = None,
+                 cfg=None,
+                 label_items: Optional[List[dict]] = None):
         self.taxonomy_by_canonical = taxonomy_by_canonical
         self.labels_by_category = labels_by_category
         self.all_labels_canonical = all_labels_canonical
+        self.other_id_by_sheet = other_id_by_sheet or {}
+        self.sheet_title_by_key = sheet_title_by_key or {}
+        self.label_items = label_items or []   # DISTINCT items (no collapsing)
+        self.light = LightInferencer(self.label_items, rules=DEFAULT_RULES)
         self.cfg = cfg or {
             "fuzzy_strict": 0.90,
             "fuzzy_loose" : 0.80,
@@ -266,87 +346,127 @@ class LabelMatcher:
         # CLEAN FIRST so everything downstream sees normalized text
         cleaned = _normalize_raw_text(right_text or "")
 
-        # Use cleaned text in the structured parser
+        # Try to extract an explicit Observation section
         fields = parse_structured_fields(cleaned)
+        obs_section = (fields.get("observation") or "").strip()
 
-        obs = (fields.get("observation") or "").strip()
-        if not obs:
+        # If not found via heading, fallback to first non-empty line(s)
+        if not obs_section:
             fallback = parse_panel_sections(cleaned or "")
-            obs = (fallback.get("observation") or "").strip()
-        if obs:
-            obs_lines = [ln for ln in obs.splitlines() if ln.strip()]
+            obs_section = (fallback.get("observation") or "").strip()
+
+        # Remove leading "Photograph x.y" if present
+        if obs_section:
+            obs_lines = [ln for ln in obs_section.splitlines() if ln.strip()]
             if obs_lines and re.match(r"(?i)^\s*photograph\b", obs_lines[0]):
-                obs = "\n".join(obs_lines[1:]).strip()
+                obs_section = "\n".join(obs_lines[1:]).strip()
 
-        disc = fields.get("discussion") or ""
-        label = obs if obs else None
-        flagged = False
-        label_source = "observation" if obs else "none"
-        if not label:
-            flagged = True
-        elif label.lower() == "other":
-            flagged = True
-            label_source = "observation=other"
+        # Determine label_source:
+        # - if we truly have an "Observation:"-style section, label_source="observation"
+        # - else label_source="full text" and we'll use the entire cleaned text to attempt a match
+        has_true_observation = bool(fields.get("observation"))
+        label_source = "observation" if has_true_observation else "full text"
 
+        # observation_raw: keep ONLY when we actually found an Observation section
+        observation_raw = obs_section if has_true_observation else ""
+
+        # photo id (informational)
         m = PHOTO_ID_RX.search(cleaned or "")
         photo_id = m.group(1).strip() if m else None
 
         return {
-            "label": label,
-            "label_source": label_source,
-            "flagged": bool(flagged),
-            "discussion_or_description": (disc or "").strip(),
-            "raw_right_text": cleaned,   # << store CLEANED text here
+            "observation_raw": observation_raw,   # empty if we didn't see a real Observation section
+            "label_source": label_source,         # "observation" or "full text"
+            "raw_right_text": cleaned,            # always store CLEANED text
             "photo_id": photo_id
         }
 
-    def _match_observation(self, obs_raw: str):
-        return match_label_text(
-            obs_raw,
-            self.taxonomy_by_canonical,
-            self.all_labels_canonical,
-            strict=self.cfg.get("fuzzy_strict", 0.90),
-            loose=self.cfg.get("fuzzy_loose", 0.80)
-        )
-
     def compute_label(self, right_text: str, page_text: str, current_section: Optional[str],
                       img_bbox, right_bbox, page_h: float) -> Dict:
+        # Derive base fields and cleaned text
         fields = self._derive_label_and_flags(right_text)
-        obs_raw = fields.get("label") or ""
-        label_source = fields.get("label_source", "none")
+        cleaned_text = fields.get("raw_right_text", right_text or "")
+        label_source = fields.get("label_source", "full text")
+        observation_raw = fields.get("observation_raw", "")
 
-        obs_label, sim = (None, 0.0)
-        if obs_raw:
-            obs_label, sim = self._match_observation(obs_raw)
-            if not obs_label:
-                first_line = obs_raw.splitlines()[0].strip()
-                obs_label2, sim2 = self._match_observation(first_line)
-                if obs_label2:
-                    obs_label, sim = obs_label2, max(sim, sim2)
+        # Choose source text for matching
+        source_text = observation_raw if label_source == "observation" else cleaned_text
 
-        flag_review = bool(fields.get("flagged", False))
+        # Label selection method tracking
+        label_method = "fuzzy"   # default; overwritten if light-infer or fallback kicks in
+        label_method_info = ""   # optional small note for debugging (e.g., matched keywords)
+        alt1_label = alt1_score = alt2_label = alt2_score = ""
+
+        # ---- MATCH AGAINST DISTINCT ITEMS (tiered: rules → BM25 → TF-IDF → fallback fuzz) ----
+        strict = self.cfg.get("fuzzy_strict", 0.90)
+        loose  = self.cfg.get("fuzzy_loose", 0.80)
+
+        best_item = None
+        sim = 0.0
+
+        if label_source == "full text" and self.label_items:
+            light = self.light.infer(source_text, sheet_hint=current_section)
+            if light.get("hit"):
+                # Accept immediately; map by id if possible, else by label text
+                best_item = next((it for it in self.label_items if it.get("id","") == light.get("id","")), None)
+                if best_item is None:
+                    best_item = next((it for it in self.label_items if it.get("label","").lower() == light["label"].lower()), None)
+                # Give a synthetic similarity consistent with your thresholds
+                sim = 0.92 if light["method"] == "rules" else (0.88 if light["method"] == "bm25" else 0.85)
+
+                # === Record which method was used + debug info ===
+                label_method = f"light:{light.get('method','')}"  # 'light:rules' | 'light:bm25' | 'light:tfidf'
+                if light.get("method") == "rules" and light.get("debug", {}).get("matched"):
+                    mk = light["debug"]["matched"]
+                    parts = []
+                    for k in ("must","any","effects","actions"):
+                        if mk.get(k):
+                            parts.append(f"{k}=" + "|".join(mk[k][:4]))
+                    label_method_info = "; ".join(parts)[:160]
+
+                # === Record alternate candidates (for debugging/evaluation) ===
+                alts = light.get("alt_candidates") or []
+                if len(alts) > 0:
+                    alt1_label, alt1_score = alts[0]["label"], round(float(alts[0]["score"]), 3)
+                if len(alts) > 1:
+                    alt2_label, alt2_score = alts[1]["label"], round(float(alts[1]["score"]), 3)
+
+        # If the lightweight tiers didn’t confidently hit, use the existing fuzzy token_set matching
+        if best_item is None:
+            best_item, sim = _match_label_item(source_text, self.label_items, current_section, strict, loose)
+
+        flag_review = False
         flag_reasons: List[str] = []
 
-        # Use cleaned text for category inference and heading detection
-        cleaned_text = fields.get("raw_right_text", right_text or "")
-        if not obs_label:
-            cat, cat_conf, reasons = infer_category_for_other(cleaned_text, page_text, current_section, self.labels_by_category)
-            obs_label = "Other"
-            obs_category = cat
-            confidence_label = min(0.65, cat_conf)
-            flag_review = True
-            flag_reasons += ["Unresolved observation → routed to category 'Other'"] + reasons
-        else:
-            can = _canon(obs_label)
-            obs_category = self.taxonomy_by_canonical[can]["category"]
+        if best_item:
+            obs_label = best_item["label"]
+            observation_id = best_item.get("id", "") or ""
+            sheet_key = best_item.get("sheet_key")
+            sheet_title = best_item.get("sheet_title")
             confidence_label = sim
-            if obs_label.lower() == "other":
-                cat, cat_conf, reasons = infer_category_for_other(cleaned_text, page_text, current_section, self.labels_by_category)
-                obs_category = cat
-                confidence_label = min(confidence_label, cat_conf)
-                flag_reasons += ["Label 'Other' → disambiguated category"] + reasons
+        else:
+            # infer sheet
+            sheet_key, cat_conf, reasons = infer_sheet_title(
+                cleaned_text, page_text, current_section,
+                self.labels_by_category, self.sheet_title_by_key
+            )
+            sheet_title = self.sheet_title_by_key.get(sheet_key, sheet_key)
+            confidence_label = min(0.65, cat_conf)
+            other_id = self.other_id_by_sheet.get(sheet_key)
+            if other_id:
+                observation_id = other_id
+                obs_label = "Other"
+                flag_reasons += [f"Routed to sheet 'Other' id {other_id}"]
+            else:
+                observation_id = sheet_title or "Unknown"
+                obs_label = "Other"
+            flag_review = True
+            flag_reasons = ["No exact label match"] + flag_reasons
 
-        # Linkage confidence
+            label_method = "sheet_fallback"
+            label_method_info = "; ".join(flag_reasons)[:160]
+
+        # Linkage confidence (geometry-based)
         if right_bbox is not None:
             p_top, p_bot = right_bbox.y0, right_bbox.y1
             region_used = "narrow"
@@ -359,7 +479,7 @@ class LabelMatcher:
         vh = max(1, (iy1 - iy0))
         vertical_overlap_ratio = vo / vh
 
-        text_density = 0.0  # neutral default; could be augmented with blocks_used
+        text_density = 0.0  # neutral default
 
         penalties = 0.0
         if p_top < self.cfg.get("header_ymax", 90):
@@ -374,24 +494,50 @@ class LabelMatcher:
             DISC_REGEX.search(cleaned_text or "") or
             RECO_REGEX.search(cleaned_text or "")
         )
-
         confidence_linkage = score_linkage(region_used, vertical_overlap_ratio, text_density, has_headings, penalties)
         if confidence_linkage < 0.35:
             flag_review = True
             flag_reasons.append(f"Low linkage confidence ({confidence_linkage:.2f})")
 
         return {
-            "raw_right_text": fields.get("raw_right_text", right_text).strip(),
-            "observation_raw": obs_raw,
-            "discussion_or_description": fields.get("discussion_or_description", ""),
-            "label_source": label_source,
+            # keep the cleaned raw text for QA; used when label_source="full text"
+            "right_text_raw": cleaned_text,
+            "raw_right_text": cleaned_text,  # back-compat shim for any legacy caller
+
+            # explicit observation section text only if present
+            "observation_raw": observation_raw,
+
+            # suppressed per spec (kept as empty string to avoid breaking CSV schema)
+            "discussion_or_description": "",
+
+            # where the label came from
+            "label_source": label_source,  # "observation" or "full text"
+
+            # report's "Photograph x.y" if present
             "photo_id": fields.get("photo_id"),
 
+            # chosen label text (may be "Other" when unresolved)
             "observation_label": obs_label,
-            "observation_category": obs_category,
+
+            # NEW field replacing observation_category
+            "observation_id": observation_id,  # exact id when known, else sheet title string
+
+            # optional shim for legacy code that still expects observation_category
+            "observation_category": sheet_title or "",
+
+            # confidences
             "confidence_label": round(float(confidence_label), 3),
             "confidence_linkage": round(float(confidence_linkage), 3),
 
+            # flags
             "flag_review": bool(flag_review),
             "flag_reason": "; ".join(flag_reasons),
+
+            # labeling method info
+            "label_method": label_method,          # 'light:rules' | 'light:bm25' | 'light:tfidf' | 'fuzzy' | 'sheet_fallback'
+            "label_method_info": label_method_info,  # small hint like matched keywords or fallback reason
+
+            # top alternative labels (for analysis)
+            "alt1_label": alt1_label, "alt1_score": alt1_score,
+            "alt2_label": alt2_label, "alt2_score": alt2_score,
         }

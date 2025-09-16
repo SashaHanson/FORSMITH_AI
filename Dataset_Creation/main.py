@@ -137,10 +137,10 @@ def diff_and_print(prev: Optional[dict], curr: dict, sort_key_fn) -> None:
 
     p_tot = prev.get("totals", {})
     c_tot = curr.get("totals", {})
-    pr = _safe_int(p_tot.get("total_reports", 0))
-    cr = _safe_int(c_tot.get("total_reports", 0))
-    pi = _safe_int(p_tot.get("total_images", 0))
-    ci = _safe_int(c_tot.get("total_images", 0))
+    pr = int(p_tot.get("total_reports", 0) or 0)
+    cr = int(c_tot.get("total_reports", 0) or 0)
+    pi = int(p_tot.get("total_images", 0) or 0)
+    ci = int(c_tot.get("total_images", 0) or 0)
     dr = cr - pr
     di = ci - pi
 
@@ -166,14 +166,24 @@ def main():
     total_docs = 0
     per_report_stats: Dict[str, Dict[str, int]] = {}
 
-    # ---- Load taxonomy and init matcher ----
-    taxonomy_by_canonical, labels_by_category, all_labels_canonical = load_labels_from_json(LABELS_JSON)
-    print(f"Loaded {len(all_labels_canonical)} labels from JSON: {LABELS_JSON}")
+    # ---- Load taxonomy and init matcher (extended=True to load ALL items) ----
+    (taxonomy_by_canonical,
+     labels_by_category,
+     all_labels_canonical,
+     other_id_by_sheet,
+     sheet_title_by_key,
+     total_labels,
+     label_items) = load_labels_from_json(LABELS_JSON, extended=True)
+
+    print(f"Loaded {total_labels} labels from JSON: {LABELS_JSON}")
 
     matcher = LabelMatcher(
         taxonomy_by_canonical=taxonomy_by_canonical,
         labels_by_category=labels_by_category,
         all_labels_canonical=all_labels_canonical,
+        other_id_by_sheet=other_id_by_sheet,
+        sheet_title_by_key=sheet_title_by_key,
+        label_items=label_items,
         cfg={
             "fuzzy_strict": 0.90,
             "fuzzy_loose" : 0.80,
@@ -238,7 +248,7 @@ def main():
 
     csv_path = safe_write_csv_with_retry(df, CSV_OUTPUT) # Write CSV
 
-    # ======== YOUR REQUESTED SUMMARY OUTPUT ========
+    # ======== SUMMARY OUTPUT ========
     print("\n================ SUMMARY ================")
     print(f"Processed reports : {total_docs}")
     print(f"Total images      : {len(all_records)}")
@@ -280,7 +290,13 @@ def main():
     }
 
     # Pretty diff vs last text snapshot (if we have prev)
-    diff_and_print(last_snapshot_compact if last_snapshot_compact else None, curr_summary, sort_key_report_id)
+    prev = None
+    if os.path.exists(_history_path()):
+        prev = {
+            "reports": _load_last_snapshot(),
+            "totals": {"total_reports": 0, "total_images": 0}  # compact compat
+        }
+    diff_and_print(prev if prev else None, curr_summary, sort_key_report_id)
 
     # Write a fresh compact text snapshot for next run
     _write_snapshot(
