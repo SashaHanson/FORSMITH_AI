@@ -49,7 +49,6 @@ COL_CHOICE_LETTER   = 3  # 4: choice_order (a/b/c/d)
 COL_REC_NAME        = 4  # 5: Choice (short label)
 COL_REC_TEXT        = 5  # 6: Text (long paragraph)
 
-
 # ---------------------------- Excel loaders ----------------------------
 
 def load_sheet_pandas(path: Path, sheet_name: str):
@@ -82,7 +81,6 @@ def list_sheets_openpyxl(path: Path):
     from openpyxl import load_workbook
     wb = load_workbook(path, data_only=True, read_only=True)
     return wb, wb.sheetnames
-
 
 # ---------------------------- Utilities ----------------------------
 
@@ -153,7 +151,6 @@ def norm_letter_strict(raw: str) -> str | None:
     if len(t) == 1 and t.isalpha():
         return t
     return None
-
 
 # ---------------------------- Core ----------------------------
 
@@ -298,7 +295,6 @@ def main():
     print("   Breakdown by sheet:")
     for s in sheets_sorted:
         print(f"     {s}: {per_sheet_counts[s]} labels")
-
 
 if __name__ == "__main__":
     main()

@@ -177,6 +177,9 @@ def main():
 
     print(f"Loaded {total_labels} labels from JSON: {LABELS_JSON}")
 
+    # e.g., from a UI/arg; must be one of: "1.0","2.0","3.0","4.0","5.0","6.0","7.0"
+    SELECTED_SHEET_PREFIX = "2.0"  # ← set this to the user-chosen roof type
+
     matcher = LabelMatcher(
         taxonomy_by_canonical=taxonomy_by_canonical,
         labels_by_category=labels_by_category,
@@ -184,13 +187,16 @@ def main():
         other_id_by_sheet=other_id_by_sheet,
         sheet_title_by_key=sheet_title_by_key,
         label_items=label_items,
-        cfg={
+        cfg = {
             "fuzzy_strict": 0.90,
-            "fuzzy_loose" : 0.80,
+            "fuzzy_loose": 0.80,
             "header_ymax": 90,
             "footer_ymin_from_bottom": 80,
             "min_panel_width": 80,
-        }
+            "sheet_prefix": SELECTED_SHEET_PREFIX, # tell matcher which sheet to restrict CE matching to
+            "accept_min_sim": 0.80, # force CE fallback when fuzzy hit is weak (< 0.75 by default)
+            "obs_min_conf_for_ce": 0.80,
+        },
     )
 
     # Load prior compact snapshot (optional pretty diff at end)

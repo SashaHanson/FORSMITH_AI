@@ -1734,7 +1734,6 @@ def main():
     # Save the snapshot for next run
     _write_snapshot(per_report_stats, total_docs, len(all_records))
 
-
 if __name__ == "__main__":
     try:
         main()

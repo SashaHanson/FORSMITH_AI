@@ -3793,8 +3793,8 @@
     {
       "sheet": "2.0 - Mod. Bit.",
       "id": "2.12.01",
-      "label": "Observation:",
-      "cause_effect": "Cause/Effect:",
+      "label": "Subsurface Moisture",
+      "cause_effect": "Subsurface moisture within the roof assembly is suspected in this area, which will reduce the performance of the roof (insulation), induce further deterioration of the roof components, and could also lead to interior leaks into the building.",
       "choice_order": [
         "a",
         "b"

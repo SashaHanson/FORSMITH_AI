@@ -169,12 +169,21 @@ class LightInferencer:
                  tfidf_thresh: float = 0.25,
                  tfidf_gap: float = 0.10):
         # Store distinct items & build corpora
-        self.items = label_items[:]  # expects dicts with "label","id","sheet_key","canon" (or we will build canon)
+        self.items = label_items[:]  # expects dicts with label/id/sheet_key/canon/label_terms metadata
         for it in self.items:
             if "canon" not in it:
                 it["canon"] = _norm(it.get("label", ""))
         self.labels = [it["label"] for it in self.items]
-        self.tokens = [_tok((it.get("label") or "") + " " + it.get("sheet_key", "")) for it in self.items]
+        def _label_context(itm):
+            parts = []
+            label_terms = itm.get("label_terms") or itm.get("label") or ""
+            if label_terms:
+                parts.append(label_terms)
+            sheet_part = itm.get("sheet_key", "")
+            if sheet_part:
+                parts.append(sheet_part)
+            return " ".join(parts)
+        self.tokens = [_tok(_label_context(it)) for it in self.items]
 
         # IR backends
         self.bm25 = BM25(self.tokens)

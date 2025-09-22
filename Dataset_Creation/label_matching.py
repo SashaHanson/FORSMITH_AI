@@ -28,11 +28,13 @@
 # - Returned dict also includes "raw_right_text" and "observation_category" shims.
 # ------------------------------------------------------------
 
-from typing import Dict, Tuple, Set, Optional, List
+from typing import Dict, Tuple, Set, Optional, List, Any
 from pathlib import Path
 from collections import defaultdict
 import json, re
 from label_inference import LightInferencer, DEFAULT_RULES
+from cause_effect_matcher import CauseEffectMatcher, build_sheet_index
+from label_synonyms import get_synonyms
 
 try:
     from rapidfuzz import fuzz as _rf_fuzz
@@ -133,13 +135,33 @@ def load_labels_from_json(json_path, *, extended: bool = False):
         sheet_title = str(item.get("sheet", item.get("category", ""))).strip()  # e.g., "6.0 - Shingle"
         sheet_key = _normalize_cat_key(sheet_title)
         can = _canon(lab)
+        synonyms = get_synonyms(lab)
+        # Deduplicate while preserving order
+        seen_syn = set()
+        normalized_synonyms = []
+        for syn in synonyms:
+            if not syn:
+                continue
+            key = syn.lower()
+            if key in seen_syn:
+                continue
+            seen_syn.add(key)
+            normalized_synonyms.append(syn)
+        syn_canons = [_canon(s) for s in normalized_synonyms if _canon(s)]
+        match_canons = [can] + [sc for sc in syn_canons if sc]
+        label_terms = " ".join([lab] + normalized_synonyms).strip()
 
         label_items.append({
             "label": lab,
             "id": lab_id,
+            "sheet": sheet_title,
             "sheet_key": sheet_key,
             "sheet_title": sheet_title,
             "canon": can,
+            "synonyms": normalized_synonyms,
+            "syn_canons": syn_canons,
+            "match_canons": match_canons,
+            "label_terms": label_terms,
         })
 
         if sheet_key:
@@ -215,6 +237,8 @@ def parse_structured_fields(right_text: str) -> Dict[str, str]:
     out["observation"] = grab("Observation") or grab("Observations")
     # We intentionally do NOT emit discussion/description anymore (suppressed downstream)
     out["_raw"] = t.strip()
+    # NEW: also stash the Cause/Effect (or discussion/description) raw text for CE matching
+    out["cause_effect_raw"] = _extract_section(out["_raw"]) or ""
     return out
 
 def parse_panel_sections(text: str):
@@ -226,6 +250,46 @@ def parse_panel_sections(text: str):
         return {"observation": None}
     return {"observation": "\n".join(lines).strip()}
 
+SECTION_HDR = re.compile(
+    r'(?mi)^\s*(Observation|Discussion|Description|Cause\s*/?\s*Effect|Cause\s*&\s*Effect|Recommendations?)\s*:?\s*$'
+)
+
+def _extract_section(panel_text: str, want=("cause/effect",)) -> str:
+    """
+    Slice the right-panel into sections by headings and return the requested block.
+    - Primary: "Cause/Effect" (various spellings)
+    - Fallback: "Discussion" or "Description"
+    """
+    if not panel_text: 
+        return ""
+    # collect sections
+    spans = []
+    for m in SECTION_HDR.finditer(panel_text):
+        spans.append((m.start(), m.end(), m.group(1).lower()))
+    if not spans:
+        return ""
+    spans.append((len(panel_text), len(panel_text), "_end"))
+
+    # build map: header -> text until next header
+    blocks = {}
+    for i in range(len(spans)-1):
+        _, end_hdr, name = spans[i]
+        start_next, _, _ = spans[i+1]
+        body = panel_text[end_hdr:start_next].strip()
+        blocks[name] = body
+
+    # normalize keys and choose
+    ce_keys = {"cause/effect", "cause & effect", "cause effect", "cause/effects", "cause & effects"}
+    for k in list(blocks.keys()):
+        nk = k.replace("&", "/").replace("  ", " ").replace("  ", " ").strip()
+        if nk in {"discussion", "description"}:
+            blocks["discussion"] = blocks[k]
+        if any(nk.startswith(x.split()[0]) for x in ce_keys) or "cause" in nk:
+            blocks["cause/effect"] = blocks[k]
+
+    # priority: cause/effect → discussion/description → ""
+    return blocks.get("cause/effect") or blocks.get("discussion") or ""
+
 # ---------------- Matching against DISTINCT items ----------------
 def _token_set_ratio(a: str, b: str) -> float:
     A = set(_canon(a).split())
@@ -233,6 +297,59 @@ def _token_set_ratio(a: str, b: str) -> float:
     if not A or not B:
         return 0.0
     return len(A & B) / len(A | B)
+
+def _normalize_plural_token(token: str) -> str:
+    token = token.strip()
+    if len(token) <= 3:
+        return token
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith(("ses", "xes", "zes", "ches", "shes")) and len(token) > 4:
+        return token[:-2]
+    if token.endswith("es") and len(token) > 3:
+        return token[:-2]
+    if token.endswith("s") and not token.endswith("ss") and len(token) > 3:
+        return token[:-1]
+    return token
+
+
+def _normalized_phrase_tokens(phrase: str) -> List[str]:
+    return [_normalize_plural_token(tok) for tok in phrase.split() if tok]
+
+
+def _containment_score(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    tokens_a = _normalized_phrase_tokens(a)
+    tokens_b = _normalized_phrase_tokens(b)
+    if not tokens_a or not tokens_b:
+        return 0.0
+    if tokens_a == tokens_b:
+        return 0.99
+
+    def _has_contiguous(sub, full):
+        n = len(sub)
+        if n > len(full) or n == 0:
+            return False
+        for i in range(len(full) - n + 1):
+            if full[i:i + n] == sub:
+                return True
+        return False
+
+    if _has_contiguous(tokens_a, tokens_b):
+        shorter, longer = tokens_a, tokens_b
+    elif _has_contiguous(tokens_b, tokens_a):
+        shorter, longer = tokens_b, tokens_a
+    else:
+        return 0.0
+
+    shorter_len = sum(len(t) for t in shorter)
+    longer_len = max(sum(len(t) for t in longer), 1)
+    ratio = shorter_len / longer_len
+    if ratio < 0.45:
+        return 0.0
+    return 0.90 + 0.09 * min(1.0, ratio)
+
 
 def _match_label_item(text: str,
                       label_items: List[dict],
@@ -249,7 +366,28 @@ def _match_label_item(text: str,
 
     best_item, best_score = None, -1.0
     for it in label_items:
-        base = (_rf_fuzz.token_set_ratio(C, it["canon"]) / 100.0) if _rf_fuzz else _token_set_ratio(C, it["canon"])
+        candidates = it.get("match_canons") or [it.get("canon", "")]
+        best_local = -1.0
+        for cand in candidates:
+            if not cand:
+                continue
+            score = (_rf_fuzz.token_set_ratio(C, cand) / 100.0) if _rf_fuzz else _token_set_ratio(C, cand)
+            contain_score = _containment_score(C, cand)
+            if contain_score > score:
+                score = contain_score
+            if score > best_local:
+                best_local = score
+        if best_local < 0:
+            continue
+        base = best_local
+        if base < 0.95:
+            syn_canons = it.get("syn_canons", [])
+            text_tokens = set(_normalized_phrase_tokens(C))
+            for syn in syn_canons:
+                syn_tokens = set(_normalized_phrase_tokens(syn))
+                if syn_tokens and syn_tokens.issubset(text_tokens):
+                    base = max(base, 0.95)
+                    break
         # small, safe bias toward the current sheet (if known)
         if sheet_hint and it.get("sheet_key") == sheet_hint:
             base += 0.03
@@ -326,29 +464,51 @@ class LabelMatcher:
                  sheet_title_by_key: Optional[Dict[str, str]] = None,
                  cfg=None,
                  label_items: Optional[List[dict]] = None):
+        # --- existing fields ---
         self.taxonomy_by_canonical = taxonomy_by_canonical
         self.labels_by_category = labels_by_category
         self.all_labels_canonical = all_labels_canonical
         self.other_id_by_sheet = other_id_by_sheet or {}
         self.sheet_title_by_key = sheet_title_by_key or {}
         self.label_items = label_items or []   # DISTINCT items (no collapsing)
+
+        # Lightweight rule-based helper you already use
         self.light = LightInferencer(self.label_items, rules=DEFAULT_RULES)
-        self.cfg = cfg or {
+
+        # --- cfg: merge user cfg over sensible defaults ---
+        default_cfg = {
             "fuzzy_strict": 0.90,
-            "fuzzy_loose" : 0.80,
-            "header_ymax": 90,
+            "fuzzy_loose":  0.80,
+            "header_ymax":  90,
             "footer_ymin_from_bottom": 80,
             "min_panel_width": 80,
+            # optional: carry currently selected sheet prefix (e.g., "2.0")
+            "sheet_prefix": None,
+            "accept_min_sim": 0.80,       # treat obs label "low-confidence" below this
+            "obs_min_conf_for_ce": 0.80,  # if obs < 0.80, run CE cross-check
         }
+        self.cfg = {**default_cfg, **(cfg or {})}
+
+        # --- NEW: store the full catalog & a per-sheet matcher cache ---
+        # all_items is the canonical catalog used by the Cause/Effect fallback
+        self.all_items = self.label_items
+
+        # carry sheet prefix (if caller passes it in cfg) for convenience
+        sp = self.cfg.get("sheet_prefix")
+        self.current_sheet_prefix = (str(sp).strip() if sp else None)
+
+        # small cache: key = sheet prefix (e.g., "2.0"), value = CauseEffectMatcher instance
+        # (created lazily where you call the fallback)
+        self._ce_cache: Dict[str, Any] = {}
 
     @staticmethod
     def _derive_label_and_flags(right_text: str) -> Dict:
         # CLEAN FIRST so everything downstream sees normalized text
         cleaned = _normalize_raw_text(right_text or "")
 
-        # Try to extract an explicit Observation section
-        fields = parse_structured_fields(cleaned)
-        obs_section = (fields.get("observation") or "").strip()
+        # Try to extract an explicit Observation section and Cause/Effect text
+        sections = parse_structured_fields(cleaned)
+        obs_section = (sections.get("observation") or "").strip()
 
         # If not found via heading, fallback to first non-empty line(s)
         if not obs_section:
@@ -364,7 +524,7 @@ class LabelMatcher:
         # Determine label_source:
         # - if we truly have an "Observation:"-style section, label_source="observation"
         # - else label_source="full text" and we'll use the entire cleaned text to attempt a match
-        has_true_observation = bool(fields.get("observation"))
+        has_true_observation = bool(sections.get("observation"))
         label_source = "observation" if has_true_observation else "full text"
 
         # observation_raw: keep ONLY when we actually found an Observation section
@@ -374,11 +534,16 @@ class LabelMatcher:
         m = PHOTO_ID_RX.search(cleaned or "")
         photo_id = m.group(1).strip() if m else None
 
+        cause_effect_raw = (sections.get("cause_effect_raw") or "").strip()
+        panel_raw = str(sections.get("_raw") or cleaned)
+
         return {
             "observation_raw": observation_raw,   # empty if we didn't see a real Observation section
             "label_source": label_source,         # "observation" or "full text"
             "raw_right_text": cleaned,            # always store CLEANED text
-            "photo_id": photo_id
+            "photo_id": photo_id,
+            "cause_effect_raw": cause_effect_raw, # extracted Cause/Effect (or discussion/description) text
+            "panel_raw": panel_raw,               # normalized right-panel text for CE fallbacks
         }
 
     def compute_label(self, right_text: str, page_text: str, current_section: Optional[str],
@@ -388,6 +553,50 @@ class LabelMatcher:
         cleaned_text = fields.get("raw_right_text", right_text or "")
         label_source = fields.get("label_source", "full text")
         observation_raw = fields.get("observation_raw", "")
+
+        panel_raw = str(fields.get("panel_raw") or cleaned_text or "")
+        cached_cause_text = None
+
+        def _get_ce_matcher(prefix: str):
+            key = prefix or "__ALL__"
+            cem = self._ce_cache.get(key)
+            if cem is None:
+                rows = build_sheet_index(self.all_items, prefix) if prefix else self.all_items
+                if rows:
+                    cem = CauseEffectMatcher(rows)
+                    self._ce_cache[key] = cem
+            return cem
+
+        def _strip_observation(block: str, obs_text: str) -> str:
+            block = (block or "").strip()
+            obs_text = (obs_text or "").strip()
+            if not block:
+                return ""
+            if not obs_text:
+                return block
+            lower_block = block.lower()
+            lower_obs = obs_text.lower()
+            idx = lower_block.find(lower_obs)
+            if idx == -1:
+                return block
+            before = block[:idx].strip()
+            after = block[idx + len(obs_text):].strip()
+            pieces = [seg for seg in (before, after) if seg]
+            return "\n".join(pieces).strip()
+
+        def _select_cause_text() -> str:
+            nonlocal cached_cause_text
+            if cached_cause_text is not None:
+                return cached_cause_text
+            candidate = (fields.get("cause_effect_raw") or "").strip()
+            if not candidate:
+                candidate = (_extract_section(panel_raw) or "").strip()
+            if not candidate:
+                candidate = _strip_observation(panel_raw, observation_raw)
+            if not candidate:
+                candidate = panel_raw.strip()
+            cached_cause_text = candidate
+            return cached_cause_text
 
         # Choose source text for matching
         source_text = observation_raw if label_source == "observation" else cleaned_text
@@ -434,8 +643,71 @@ class LabelMatcher:
         # If the lightweight tiers didn’t confidently hit, use the existing fuzzy token_set matching
         if best_item is None:
             best_item, sim = _match_label_item(source_text, self.label_items, current_section, strict, loose)
+        elif sim < self.cfg.get("accept_min_sim", 0.75):
+            best_item, sim = None, 0.0  # force CE fallback to run
+
+        # --- NEW: If we matched via Observation but it's weak, cross-check with Cause/Effect ---
+        obs_ce_threshold = float(self.cfg.get("obs_min_conf_for_ce", 0.80))
+        if label_source == "observation" and sim < obs_ce_threshold:
+            sheet_prefix = (self.cfg.get("sheet_prefix") or getattr(self, "current_sheet_prefix", "") or "").strip()
+            extracted_obs_text = (observation_raw or "").strip()
+            if not extracted_obs_text:
+                extracted_obs_text = source_text.strip()
+            extracted_cause_text = _select_cause_text().strip()
+
+            if extracted_cause_text:
+                cem = _get_ce_matcher(sheet_prefix) or _get_ce_matcher(None)
+                if cem is not None:
+                    ce_matches = cem.match(extracted_obs_text, extracted_cause_text, top_k=3)
+                    if ce_matches:
+                        ce_best = ce_matches[0]
+                        ce_conf = float(ce_best.confidence)
+                        obs_conf = float(sim)
+                        if ce_conf > obs_conf:
+                            row = ce_best.item if ce_best.item else {
+                                "sheet": ce_best.sheet,
+                                "id": ce_best.defect_id,
+                                "label": ce_best.label,
+                                "cause_effect": ce_best.cause_effect,
+                            }
+                            best_item = dict(row)
+                            sim = ce_conf
+                            label_method = "cause_effect_crosscheck"
+                            label_method_info = f"raw={ce_best.score:.3f}; ce={ce_conf:.3f}; obs={obs_conf:.3f}"
+                        elif obs_conf:
+                            label_method_info = f"obs={obs_conf:.3f}; ce={ce_conf:.3f}"
 
         flag_review = False
+
+        # --- Cause/Effect similarity fallback (per-sheet, calibrated) ---
+        if best_item is None:
+            # pull the user-selected sheet (e.g., "2.0") if you passed it via cfg/__init__
+            sheet_prefix = (self.cfg.get("sheet_prefix") or getattr(self, "current_sheet_prefix", "") or "").strip()
+
+            # Use your already-parsed texts (Observation + Cause/Effect heuristics)
+            extracted_obs_text = (observation_raw or "").strip()
+            if not extracted_obs_text:
+                extracted_obs_text = source_text.strip()
+            extracted_cause_text = _select_cause_text().strip()
+
+            if extracted_cause_text:
+                cem = _get_ce_matcher(sheet_prefix) or _get_ce_matcher(None)
+                if cem is not None:
+                    ce_matches = cem.match(extracted_obs_text, extracted_cause_text, top_k=3)
+                    if ce_matches and ce_matches[0].confidence >= 0.40:  # tune 0.35–0.50 as needed
+                        ce_best = ce_matches[0]
+                        row = ce_best.item if ce_best.item else {
+                            "sheet": ce_best.sheet,
+                            "id": ce_best.defect_id,
+                            "label": ce_best.label,
+                            "cause_effect": ce_best.cause_effect,
+                        }
+                        best_item = dict(row)
+                        # Treat CE confidence as similarity so downstream logic works unchanged
+                        sim = float(ce_best.confidence)
+                        label_method = "cause_effect_fallback"
+                        label_method_info = f"raw={ce_best.score:.3f}; conf={ce_best.confidence:.3f}"
+
         flag_reasons: List[str] = []
 
         if best_item:
@@ -534,7 +806,7 @@ class LabelMatcher:
             "flag_reason": "; ".join(flag_reasons),
 
             # labeling method info
-            "label_method": label_method,          # 'light:rules' | 'light:bm25' | 'light:tfidf' | 'fuzzy' | 'sheet_fallback'
+            "label_method": label_method,  # 'light:rules' | 'light:bm25' | 'light:tfidf' | 'fuzzy' | 'cause_effect_fallback' | 'sheet_fallback'
             "label_method_info": label_method_info,  # small hint like matched keywords or fallback reason
 
             # top alternative labels (for analysis)

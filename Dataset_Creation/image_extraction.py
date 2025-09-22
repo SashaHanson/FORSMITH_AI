@@ -7,8 +7,20 @@
 
 from typing import List, Optional, Dict, Tuple, Set
 from collections import defaultdict
-import fitz  # PyMuPDF
 import os, re
+
+try:
+    import fitz  # PyMuPDF (used for both images and text blocks to keep coordinates consistent)
+except ImportError:
+    import pymupdf as fitz  # some envs expose it this way
+
+# Optional OCR fallback (only used when text layer is empty)
+USE_OCR_FALLBACK = False
+try:
+    import pytesseract
+    from PIL import Image
+except Exception:
+    pytesseract = None
 
 # ---------- HEADER / FOOTER + SIZE FILTERS (unchanged) ----------
 HEADER_BAND_FRAC = 0.10
@@ -196,6 +208,172 @@ def save_pixmap_as_rgb(doc: fitz.Document, xref: int, filepath: str) -> bool:
             pix = None
         except Exception:
             pass
+
+# ---- Right-of-image text extraction helpers ----
+def _page_rect(page):
+    """Return (x0, y0, x1, y1) of the page in display coordinates."""
+    pb = page.bound() if hasattr(page, "bound") else page.rect
+    return float(pb.x0), float(pb.y0), float(pb.x1), float(pb.y1)
+
+def _get_text_blocks(page) -> List[Tuple[float, float, float, float, str]]:
+    """
+    Returns text blocks as (x0, y0, x1, y1, text), using PyMuPDF to keep a single coordinate system.
+    """
+    flags = fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_INHIBIT_SPACES
+    blocks = page.get_text("blocks", flags=flags) or []
+    out = []
+    for b in blocks:
+        # PyMuPDF blocks: (x0, y0, x1, y1, "text", block_no, block_type, ...)
+        if len(b) >= 5 and isinstance(b[4], str):
+            x0, y0, x1, y1, text = float(b[0]), float(b[1]), float(b[2]), float(b[3]), b[4]
+            out.append((x0, y0, x1, y1, text))
+    return out
+
+def _strip_header_footer(blocks, page_h, header_h=36.0, footer_h=36.0):
+    """Drop blocks that sit inside header/footer zones."""
+    kept = []
+    for x0, y0, x1, y1, t in blocks:
+        if y1 <= header_h:   # header
+            continue
+        if y0 >= (page_h - footer_h):  # footer
+            continue
+        kept.append((x0, y0, x1, y1, t))
+    return kept
+
+def _clean_footer_lines(text: str) -> str:
+    """Remove boilerplate like 'Page X of Y' that sometimes slips through."""
+    lines = []
+    for ln in text.splitlines():
+        if re.fullmatch(r"\s*Page\s+\d+\s+of\s+\d+\s*", ln.strip(), re.I):
+            continue
+        lines.append(ln)
+    return "\n".join(lines).strip()
+
+def _rect_union(rects: List[Tuple[float,float,float,float]]):
+    if not rects:
+        return None
+    xs0 = min(r[0] for r in rects); ys0 = min(r[1] for r in rects)
+    xs1 = max(r[2] for r in rects); ys1 = max(r[3] for r in rects)
+    return (xs0, ys0, xs1, ys1)
+
+def _rect_intersection(a, b):
+    if not a or not b: 
+        return None
+    x0 = max(a[0], b[0]); y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2]); y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+def _rect_area(r):
+    return 0 if not r else max(0.0, (r[2]-r[0])) * max(0.0, (r[3]-r[1]))
+
+def _blocks_in_rect(blocks, region):
+    out = []
+    for x0, y0, x1, y1, t in blocks:
+        inter = _rect_intersection((x0,y0,x1,y1), region)
+        if inter and _rect_area(inter) > 0.25*_rect_area((x0,y0,x1,y1)):
+            out.append((x0, y0, x1, y1, t))
+    return out
+
+def _concat_blocks(blocks):
+    # sort top-to-bottom, then left-to-right modestly
+    blocks = sorted(blocks, key=lambda b: (round(b[1],1), round(b[0],1)))
+    parts = []
+    for _, _, _, _, t in blocks:
+        parts.append(t.rstrip())
+    return "\n".join(parts).strip()
+
+def _ocr_region(page, region):
+    if not (USE_OCR_FALLBACK and pytesseract):
+        return ""
+    mat = fitz.Matrix(2, 2)  # upscale for better OCR
+    clip = fitz.Rect(*region)
+    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    try:
+        return pytesseract.image_to_string(img) or ""
+    except Exception:
+        return ""
+
+def extract_right_text(page, image_rect, *, gutter=14.0, headroom=60.0, footroom=60.0,
+                       min_primary_chars=80, page_margin=18.0) -> Tuple[str, Dict[str, str]]:
+    """
+    Primary approach: take text blocks to the RIGHT of the image, within an expanded vertical band.
+    Fallback 1: expand vertically to full body (minus header/footer).
+    Fallback 2: nearest 'caption/proximity' blocks on right half of page.
+    Fallback 3: OCR the right region if PDF text layer is empty.
+    Returns (text, diagnostics).
+    """
+    page_x0, page_y0, page_x1, page_y1 = _page_rect(page)
+    page_w = page_x1 - page_x0
+    blocks = _get_text_blocks(page)
+    blocks = _strip_header_footer(blocks, page_y1, header_h=36.0, footer_h=36.0)
+
+    # base right region next to image
+    ix0, iy0, ix1, iy1 = image_rect
+    right_x0 = min(page_x1 - page_margin, max(ix1 + gutter, page_x0 + page_margin))
+    right_region_primary = (right_x0, max(page_y0 + page_margin, iy0 - headroom),
+                            page_x1 - page_margin, min(page_y1 - page_margin, iy1 + footroom))
+
+    # Strategy A: primary band
+    selA = _blocks_in_rect(blocks, right_region_primary)
+    textA = _clean_footer_lines(_concat_blocks(selA))
+    if len(textA) >= min_primary_chars:
+        return textA, {
+            "strategy": "primary",
+            "right_text_chars": str(len(textA)),
+            "region": str(right_region_primary),
+            "footer_dropped": "1" if textA != _concat_blocks(selA) else "0"
+        }
+
+    # Strategy B: widened vertical band (whole body, still right-of-image)
+    right_region_wide = (right_x0, page_y0 + page_margin, page_x1 - page_margin, page_y1 - page_margin)
+    selB = _blocks_in_rect(blocks, right_region_wide)
+    textB = _clean_footer_lines(_concat_blocks(selB))
+    if len(textB) >= min_primary_chars:
+        return textB, {
+            "strategy": "expanded-vertical",
+            "right_text_chars": str(len(textB)),
+            "region": str(right_region_wide),
+            "footer_dropped": "1" if textB != _concat_blocks(selB) else "0"
+        }
+
+    # Strategy C: proximity on the right half of page (one-column or odd layouts)
+    right_half = (page_x0 + page_w*0.5, page_y0 + page_margin, page_x1 - page_margin, page_y1 - page_margin)
+    # pull blocks whose vertical center is near the image (±180 pt)
+    near = []
+    mid_y = 0.5*(iy0+iy1)
+    for x0, y0, x1, y1, t in _blocks_in_rect(blocks, right_half):
+        cy = 0.5*(y0+y1)
+        if abs(cy - mid_y) <= 180.0 or (y0 <= iy1+180.0 and y1 >= iy0-180.0):
+            near.append((x0,y0,x1,y1,t))
+    textC = _clean_footer_lines(_concat_blocks(near))
+    if len(textC) >= 40:  # lower threshold for proximity
+        return textC, {
+            "strategy": "proximity-right-half",
+            "right_text_chars": str(len(textC)),
+            "region": str(right_half),
+            "footer_dropped": "1" if textC != _concat_blocks(near) else "0"
+        }
+
+    # Strategy D: OCR fallback on the primary right region
+    ocr_text = _ocr_region(page, right_region_primary).strip()
+    if ocr_text:
+        return ocr_text, {
+            "strategy": "ocr-fallback",
+            "right_text_chars": str(len(ocr_text)),
+            "region": str(right_region_primary),
+            "footer_dropped": "n/a"
+        }
+
+    # Give up gracefully
+    return "", {
+        "strategy": "none",
+        "right_text_chars": "0",
+        "region": str(right_region_primary),
+        "footer_dropped": "0"
+    }
 
 # ---------------- Layout check: left image / right text -------------
 def page_has_left_image_right_text_layout(page) -> Tuple[bool, Dict]:
@@ -534,10 +712,24 @@ def extract_images_on_page(doc, page_idx: int, pdf_name: str, images_dir: str, m
         if DEBUG_IMAGES:
             print(f"      + kept image xref={xref} -> {filename} @ {tuple(bbox)}")
 
-        right = right_text_for_image(page, bbox)
-        right_text = right.get("text", "") or ""
-        right_bbox = right.get("bbox")
-        right_blocks_used = right.get("blocks_used", 0)
+        # Build image rect in plain tuple coords for the extractor
+        img_rect = (float(bbox.x0), float(bbox.y0), float(bbox.x1), float(bbox.y1))
+
+        # Use the new extractor (must be defined earlier in this file)
+        # Returns (text, diag) where diag contains strategy/region/char count/footer flag
+        right_text, diag = extract_right_text(page, img_rect)
+
+        # Try to coerce the diagnostic 'region' back to a bbox (for CSV + downstream)
+        right_bbox = None
+        try:
+            import ast
+            r = diag.get("region", None)
+            if r:
+                r_tuple = ast.literal_eval(r) if isinstance(r, str) else r
+                if isinstance(r_tuple, (list, tuple)) and len(r_tuple) == 4:
+                    right_bbox = fitz.Rect(*[float(v) for v in r_tuple])
+        except Exception:
+            right_bbox = None
 
         # current 1.0–7.0 section from page text (for priors)
         raw_page = page_text_raw(page)
@@ -547,8 +739,15 @@ def extract_images_on_page(doc, page_idx: int, pdf_name: str, images_dir: str, m
             if m:
                 current_section = f"{m.group(1)}.0"
 
-        # Delegate full labeling (observation/discussion parsing, taxonomy match, linkage)
-        label_info = matcher.compute_label(right_text, raw_page, current_section, bbox, right_bbox, page_h)
+        # Delegate full labeling (observation parsing + taxonomy match)
+        label_info = matcher.compute_label(
+            right_text,
+            raw_page,
+            current_section,
+            bbox,                       # image bbox (fitz.Rect)
+            right_bbox,                 # right text bbox (fitz.Rect or None)
+            page_h
+        )
 
         rec = {
             "report_id": pdf_name,
@@ -556,14 +755,20 @@ def extract_images_on_page(doc, page_idx: int, pdf_name: str, images_dir: str, m
             "image_index": kept,
             "image_file": filename,
 
-            "bbox": tuple(bbox),
+            "bbox": (float(bbox.x0), float(bbox.y0), float(bbox.x1), float(bbox.y1)),
             "page_width": page_w,
             "page_height": page_h,
 
-            "right_text_bbox": tuple(right_bbox) if right_bbox else None,
-            "right_text_blocks_used": right_blocks_used,
+            # Right-text capture (new diagnostics included)
+            "right_text_bbox": (float(right_bbox.x0), float(right_bbox.y0), float(right_bbox.x1), float(right_bbox.y1)) if right_bbox else None,
+            "right_text_blocks_used": None,  # not applicable with new extractor
             "right_text_raw": label_info["right_text_raw"],
+            "right_text_strategy": diag.get("strategy"),
+            "right_text_chars": int(diag.get("right_text_chars", "0") or 0),
+            "right_region": diag.get("region"),
+            "right_footer_dropped": diag.get("footer_dropped"),
 
+            # Parsed + matched label fields
             "observation_raw": label_info["observation_raw"],
             "discussion_or_description": label_info["discussion_or_description"],
             "label_source": label_info["label_source"],
@@ -577,7 +782,7 @@ def extract_images_on_page(doc, page_idx: int, pdf_name: str, images_dir: str, m
             "flag_review": label_info["flag_review"],
             "flag_reason": label_info["flag_reason"],
 
-            # NEW: lightweight labeler provenance + alternates
+            # Provenance / alternates
             "label_method": label_info.get("label_method"),
             "label_method_info": label_info.get("label_method_info"),
             "alt1_label": label_info.get("alt1_label"),
