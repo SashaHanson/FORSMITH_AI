@@ -1,1 +1,5 @@
 This code is responsible for scanning the reports (as PDFs) and extracting all images that fall under the "observation and recommendation" sections of the reports and turing these images into a structured dataset of labeled data. The labels are determined by utilizing the adjacent text to each image and pairing it with a label from forsmith_roof_labels.json.
+
+TODO:
+- Add a "report_id" column to the labels.xlsx to ease the runtime iteration on RAMRE to allow for GroupKFold with less steps.
+- 

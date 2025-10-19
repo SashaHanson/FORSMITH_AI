@@ -7,7 +7,7 @@
 # - Prints end-of-run SUMMARY and per-report table
 # ------------------------------------------------------------
 
-import os, glob, re, json, datetime
+import os, glob, re, json, datetime, shutil
 from typing import List, Dict, Tuple, Optional, Set
 from pathlib import Path
 import pandas as pd
@@ -23,8 +23,11 @@ IMAGES_DIR  = r"D:\FORSMITH - AI\Dataset\Images"
 CSV_OUTPUT  = r"D:\FORSMITH - AI\Dataset\image_metadata.csv"
 RUN_HISTORY_TXT = r"D:\FORSMITH - AI\Dataset\run_summary.txt"
 LABELS_JSON = r"D:\FORSMITH - AI\Code\Label_Extraction\forsmith_roof_labels.json"
+DATASET_ROOT = os.path.dirname(IMAGES_DIR)
+BUCKET_DIR   = os.path.join(DATASET_ROOT, "Bucket")
 
 os.makedirs(IMAGES_DIR, exist_ok=True)
+os.makedirs(BUCKET_DIR, exist_ok=True)
 
 # --------------------- CSV safe write with retry ---------------------
 def safe_write_csv_with_retry(df: pd.DataFrame, path: str) -> str:
@@ -94,6 +97,81 @@ def _write_snapshot(per_report_stats: Dict[str, Dict[str, int]], total_docs: int
                 f.write(f"{rid}|{stats.get('pages_used', 0)}|{stats.get('images', 0)}\n")
     except Exception as e:
         print(f"⚠️  Could not write run history: {e}")
+
+
+BUCKET_CONF_THRESHOLD = 0.5
+
+def export_bucket_views(df: pd.DataFrame, images_dir: str, bucket_root: str, threshold: float = BUCKET_CONF_THRESHOLD) -> None:
+    '''Write bucketed image copies and confidence-focused Excel views.'''
+    print("Exporting bucketed views...")
+    
+    bucket_root_path = Path(bucket_root)
+    bucket_root_path.mkdir(parents=True, exist_ok=True)
+
+    if df.empty:
+        print('Bucket export skipped: no records.')
+        return
+
+    required_cols = {'image_file', 'observation_label', 'confidence_label'}
+    missing_cols = required_cols.difference(df.columns)
+    if missing_cols:
+        print(f'Bucket export skipped: missing columns {sorted(missing_cols)}')
+        return
+
+    conf_series = pd.to_numeric(df['confidence_label'], errors='coerce').fillna(0.0)
+    df_copy = df.copy()
+    df_copy['_bucket_confidence'] = conf_series
+    if 'observation_id' not in df_copy.columns:
+        df_copy['observation_id'] = pd.NA
+
+    specs = [
+        ('high_confidence', df_copy['_bucket_confidence'] > threshold),
+        ('low_confidence', df_copy['_bucket_confidence'] <= threshold),
+    ]
+
+    images_dir_path = Path(images_dir)
+    missing_files: List[str] = []
+
+    for bucket_name, mask in specs:
+        bucket_df = df_copy[mask].copy()
+        bucket_path = bucket_root_path / bucket_name
+        images_path = bucket_path / 'images'
+        labels_path = bucket_path / 'labels'
+
+        if images_path.exists():
+            shutil.rmtree(images_path)
+        images_path.mkdir(parents=True, exist_ok=True)
+        labels_path.mkdir(parents=True, exist_ok=True)
+
+        if not bucket_df.empty:
+            bucket_df = bucket_df.sort_values('_bucket_confidence', ascending=True)
+            for row in bucket_df.itertuples():
+                image_name = getattr(row, 'image_file')
+                src = images_dir_path / image_name
+                if not src.exists():
+                    missing_files.append(str(src))
+                    continue
+                dest = images_path / image_name
+                try:
+                    shutil.copy2(src, dest)
+                except Exception:
+                    missing_files.append(str(src))
+
+            if bucket_name == 'high_confidence' and bucket_df['observation_id'].isna().all():
+                print('Bucket/high_confidence warning: observation_id missing for all records.')
+
+            labels_export = (
+                bucket_df.loc[:, ['image_file', 'observation_label', 'observation_id', '_bucket_confidence']]
+                .rename(columns={'observation_label': 'label', '_bucket_confidence': 'confidence'})
+            )
+        else:
+            labels_export = pd.DataFrame(columns=['image_file', 'label', 'observation_id', 'confidence'])
+
+        labels_export.to_excel(labels_path / 'labels.xlsx', index=False)
+        print(f'Bucket/{bucket_name}: {len(bucket_df)} image(s)')
+
+    if missing_files:
+        print(f'Bucket export: {len(missing_files)} image(s) could not be copied (missing files).')
 
 def diff_and_print(prev: Optional[dict], curr: dict, sort_key_fn) -> None:
     print("\n================ RUN DIFF vs LAST =================")
@@ -253,6 +331,7 @@ def main():
         df["rtdy"] = df["rty1"] - df["rty0"]
 
     csv_path = safe_write_csv_with_retry(df, CSV_OUTPUT) # Write CSV
+    export_bucket_views(df, IMAGES_DIR, BUCKET_DIR)
 
     # ======== SUMMARY OUTPUT ========
     print("\n================ SUMMARY ================")
