@@ -1,0 +1,23 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Ignore virtual environments
+.venv/
+venv/
+
+# Ignore model and dataset caches
+.cache/
+*.safetensors
+*.pt
+
+# Ignore OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Ignore large or private runtime data
+*.log
+*.tmp

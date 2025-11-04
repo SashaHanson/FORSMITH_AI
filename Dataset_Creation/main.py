@@ -7,7 +7,7 @@
 # - Prints end-of-run SUMMARY and per-report table
 # ------------------------------------------------------------
 
-import os, glob, re, json, datetime, shutil
+import os, glob, re, json, datetime, shutil, time
 from typing import List, Dict, Tuple, Optional, Set
 from pathlib import Path
 import pandas as pd
@@ -239,6 +239,7 @@ def diff_and_print(prev: Optional[dict], curr: dict, sort_key_fn) -> None:
 
 # ------------------------------- Main -------------------------------
 def main():
+    run_start = time.perf_counter()
     pdf_files = glob.glob(os.path.join(REPORTS_DIR, "*.pdf"))
     all_records: List[Dict] = []
     total_docs = 0
@@ -293,9 +294,11 @@ def main():
                 prev_reports[key] = {"pages_used": int(a), "images": int(b)}
         last_snapshot_compact = {"reports": prev_reports, "totals": totals}
 
-    for pdf in pdf_files:
+    total_reports = len(pdf_files)
+
+    for idx, pdf in enumerate(pdf_files, start=1):
         total_docs += 1
-        print(f"\nExtracting from {pdf} ...")
+        print(f"\n[{idx}/{total_reports}] Extracting from {pdf} ...")
         recs, n_pages, pages_used = extract_images_from_pdf(pdf, IMAGES_DIR, matcher)
         all_records.extend(recs)
 
@@ -306,6 +309,7 @@ def main():
         per_report_stats[report_id]["images"]      = len(recs)
 
         print(f"• Extracted {len(recs)} image(s) from {os.path.basename(pdf)}")
+        print(f"[{idx}/{total_reports}] Completed {os.path.basename(pdf)}")
 
     df = pd.DataFrame(all_records)
 
@@ -338,7 +342,9 @@ def main():
     print(f"Processed reports : {total_docs}")
     print(f"Total images      : {len(all_records)}")
     print(f"Images folder     : {IMAGES_DIR}")
+    elapsed = time.perf_counter() - run_start
     print(f"Metadata CSV      : {csv_path}")
+    print(f"Run duration      : {elapsed/60:.2f} min ({elapsed:.1f} sec)")
     print("=========================================")
 
     # --- Per-report table (Total pages, Pages with images, Total images) ---
@@ -347,9 +353,9 @@ def main():
         for rid, stats in per_report_stats.items():
             rows.append({
                 "report_id": rid,
-                "total_pages": stats["total_pages"],
-                "pages_with_images": stats["pages_used"],
-                "image_count": stats["images"],
+                "total_pages": stats.get("total_pages", 0),
+                "pages_with_images": stats.get("pages_used", 0),
+                "image_count": stats.get("images", 0),
             })
         tdf = pd.DataFrame(rows)
         tdf = tdf.sort_values(by="report_id", key=lambda col: col.map(sort_key_report_id))

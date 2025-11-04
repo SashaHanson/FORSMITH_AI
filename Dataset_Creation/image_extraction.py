@@ -5,7 +5,7 @@
 # - Delegates label logic to a LabelMatcher provided by caller
 # ------------------------------------------------------------
 
-from typing import List, Optional, Dict, Tuple, Set
+from typing import List, Optional, Dict, Tuple, Set, Any
 from collections import defaultdict
 import os, re
 
@@ -13,6 +13,11 @@ try:
     import fitz  # PyMuPDF (used for both images and text blocks to keep coordinates consistent)
 except ImportError:
     import pymupdf as fitz  # some envs expose it this way
+
+# PyMuPDF 1.26 tightened/renamed several constants; fall back gracefully when absent.
+TEXT_PRESERVE_LIGATURES = getattr(fitz, "TEXT_PRESERVE_LIGATURES", 0)
+TEXT_INHIBIT_SPACES = getattr(fitz, "TEXT_INHIBIT_SPACES", 0)
+TEXTFLAGS_BLOCKS = TEXT_PRESERVE_LIGATURES | TEXT_INHIBIT_SPACES
 
 # Optional OCR fallback (only used when text layer is empty)
 USE_OCR_FALLBACK = False
@@ -133,7 +138,7 @@ def page_text_raw(page) -> str:
 def get_text_blocks(page):
     blocks = []
     try:
-        for b in page.get_text("blocks") or []:
+        for b in page.get_text("blocks", flags=TEXTFLAGS_BLOCKS) or []:
             if len(b) >= 7 and b[6] == 0 and isinstance(b[4], str):
                 blocks.append((fitz.Rect(b[0], b[1], b[2], b[3]), b[4]))
             elif len(b) >= 5 and isinstance(b[4], str):
@@ -143,16 +148,96 @@ def get_text_blocks(page):
     return blocks
 
 # ---------------------- Image helpers ----------------------
-def get_image_rects(page):
-    rects = []
-    for img in page.get_images(full=True):
-        xref = img[0]
+def _rect_area_fitz(rect: Optional[fitz.Rect]) -> float:
+    if rect is None:
+        return 0.0
+    if hasattr(rect, "get_area"):
         try:
-            for r in page.get_image_rects(xref):
-                rects.append((fitz.Rect(r), xref))
+            return float(rect.get_area())
         except Exception:
-            continue
-    return rects
+            pass
+    width = getattr(rect, "width", rect.x1 - rect.x0)
+    height = getattr(rect, "height", rect.y1 - rect.y0)
+    return max(0.0, float(width)) * max(0.0, float(height))
+
+def get_image_rects(page):
+    """
+    Collect (rect, xref) pairs for images drawn on the page.
+    Prefer the native get_image_rects API when available; fall back to rawdict scanning otherwise.
+    """
+    cleaned: List[Tuple[fitz.Rect, int]] = []
+
+    get_rects = getattr(page, "get_image_rects", None)
+    if callable(get_rects):
+        for img in page.get_images(full=True):
+            xref = img[0]
+            try:
+                rects = get_rects(xref) or []
+            except Exception:
+                rects = []
+            for r in rects:
+                try:
+                    cleaned.append((fitz.Rect(r), int(xref)))
+                except Exception:
+                    continue
+
+    if cleaned:
+        return cleaned
+
+    # Fallback: PyMuPDF 1.26 exposes image blocks via rawdict when get_image_rects misbehaves.
+    candidates: List[Dict[str, Any]] = []
+    try:
+        raw = page.get_text("rawdict")
+    except Exception:
+        raw = None
+    if isinstance(raw, dict):
+        for block in raw.get("blocks", []):
+            if not isinstance(block, dict) or block.get("type") != 1:
+                continue
+            bbox = block.get("bbox")
+            xref = block.get("xref")
+            number_idx = block.get("number")
+            if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+                continue
+
+            rect = fitz.Rect(*bbox)
+            xref_val: Optional[int] = None
+            if isinstance(xref, int) and xref > 0:
+                xref_val = xref
+            else:
+                try:
+                    xv = int(xref)
+                    if xv > 0:
+                        xref_val = xv
+                except (TypeError, ValueError):
+                    xref_val = None
+
+            candidates.append({
+                "rect": rect,
+                "xref": xref_val,
+                "image_idx": int(number_idx) if isinstance(number_idx, int) else None,
+            })
+
+    if candidates:
+        image_lookup = {}
+        try:
+            for idx, img in enumerate(page.get_images(full=True)):
+                image_lookup[idx] = img[0]
+        except Exception:
+            image_lookup = {}
+        for cand in candidates:
+            if cand.get("xref") is None and cand.get("image_idx") is not None:
+                mapped = image_lookup.get(cand["image_idx"])
+                if mapped is not None:
+                    cand["xref"] = int(mapped)
+        for cand in candidates:
+            rect = cand.get("rect")
+            xref_val = cand.get("xref")
+            if xref_val is None:
+                continue
+            cleaned.append((rect, int(xref_val)))
+
+    return cleaned
 
 def cluster_rects(rects: List[fitz.Rect]) -> Optional[fitz.Rect]:
     """Union all rects; return None if empty."""
@@ -172,8 +257,8 @@ def is_header_or_footer(bbox: fitz.Rect, page_rect: fitz.Rect) -> bool:
     return bbox.y1 <= y_top or bbox.y0 >= y_bot
 
 def is_tiny_logo(bbox: fitz.Rect, page_rect: fitz.Rect) -> bool:
-    area = bbox.get_area()
-    page_area = page_rect.get_area()
+    area = _rect_area_fitz(bbox)
+    page_area = _rect_area_fitz(page_rect)
     return (area / max(1, page_area)) < MIN_IMAGE_AREA_FRAC
 
 def save_pixmap_as_rgb(doc: fitz.Document, xref: int, filepath: str) -> bool:
@@ -380,7 +465,7 @@ def page_has_left_image_right_text_layout(page) -> Tuple[bool, Dict]:
     info = {}
     page_rect = page.rect
     pw = page_rect.width
-    page_area = page_rect.get_area()
+    page_area = _rect_area_fitz(page_rect)
 
     img_rects_xref = get_image_rects(page)
     text_rects = [r for r, _ in get_text_blocks(page)]
@@ -404,7 +489,7 @@ def page_has_left_image_right_text_layout(page) -> Tuple[bool, Dict]:
         info["reason"] = "no clusters"
         return False, info
 
-    if (img_cluster.get_area() / max(1.0, page_area)) < MIN_COMBINED_IMAGE_AREA_FRAC:
+    if (_rect_area_fitz(img_cluster) / max(1.0, page_area)) < MIN_COMBINED_IMAGE_AREA_FRAC:
         info["reason"] = "combined-image-area tiny"
         return False, info
 

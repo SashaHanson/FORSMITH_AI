@@ -31,10 +31,12 @@
 from typing import Dict, Tuple, Set, Optional, List, Any
 from pathlib import Path
 from collections import defaultdict
-import json, re
+import json, re, logging
 from label_inference import LightInferencer, DEFAULT_RULES
 from cause_effect_matcher import CauseEffectMatcher, build_sheet_index
-from label_synonyms import get_synonyms
+from semantic_inferencer import SemanticInferencer, SemanticMatchResult
+
+logger = logging.getLogger(__name__)
 
 try:
     from rapidfuzz import fuzz as _rf_fuzz
@@ -135,21 +137,10 @@ def load_labels_from_json(json_path, *, extended: bool = False):
         sheet_title = str(item.get("sheet", item.get("category", ""))).strip()  # e.g., "6.0 - Shingle"
         sheet_key = _normalize_cat_key(sheet_title)
         can = _canon(lab)
-        synonyms = get_synonyms(lab)
-        # Deduplicate while preserving order
-        seen_syn = set()
-        normalized_synonyms = []
-        for syn in synonyms:
-            if not syn:
-                continue
-            key = syn.lower()
-            if key in seen_syn:
-                continue
-            seen_syn.add(key)
-            normalized_synonyms.append(syn)
-        syn_canons = [_canon(s) for s in normalized_synonyms if _canon(s)]
-        match_canons = [can] + [sc for sc in syn_canons if sc]
-        label_terms = " ".join([lab] + normalized_synonyms).strip()
+        normalized_synonyms: List[str] = []
+        syn_canons: List[str] = []
+        match_canons = [can]
+        label_terms = lab
 
         label_items.append({
             "label": lab,
@@ -486,8 +477,34 @@ class LabelMatcher:
             "sheet_prefix": None,
             "accept_min_sim": 0.80,       # treat obs label "low-confidence" below this
             "obs_min_conf_for_ce": 0.80,  # if obs < 0.80, run CE cross-check
+            # neural retrieval + rerank settings
+            "neural_enabled": True,
+            "neural_device": None,  # auto-select
+            "neural_embedding_model": "intfloat/e5-large-v2",
+            "neural_cross_encoder_model": "cross-encoder/nli-deberta-v3-large",
+            "neural_cache_dir": ".cache/label_embeddings",
+            "neural_embedding_cache_name": None,
+            "neural_top_k": 25,
+            "neural_retrieval_batch_size": 64,
+            "neural_cross_batch_size": 8,
+            "neural_min_retrieval_score": 0.15,
+            "neural_min_cross_score": 0.45,
+            "neural_confidence_floor": 0.55,
+            "neural_sheet_bias": 0.03,
+            "neural_refresh_embeddings": False,
+            "neural_accept_min_confidence": 0.60,
+            "neural_confidence_calibration": None,
         }
         self.cfg = {**default_cfg, **(cfg or {})}
+
+        self.logger = logger
+
+        self.semantic_inferencer: Optional[SemanticInferencer] = None
+        if self.cfg.get("neural_enabled") and self.label_items:
+            try:
+                self.semantic_inferencer = SemanticInferencer(self.label_items, self.cfg)
+            except Exception as exc:
+                self.logger.warning("Semantic inferencer disabled: %s", exc)
 
         # --- NEW: store the full catalog & a per-sheet matcher cache ---
         # all_items is the canonical catalog used by the Cause/Effect fallback
@@ -607,11 +624,13 @@ class LabelMatcher:
         alt1_label = alt1_score = alt2_label = alt2_score = ""
 
         # ---- MATCH AGAINST DISTINCT ITEMS (tiered: rules → BM25 → TF-IDF → fallback fuzz) ----
+        # ---- MATCHING STACK (rules -> neural retrieval -> cross-encoder -> fuzzy) ----
         strict = self.cfg.get("fuzzy_strict", 0.90)
         loose  = self.cfg.get("fuzzy_loose", 0.80)
 
         best_item = None
         sim = 0.0
+        semantic_result: Optional[SemanticMatchResult] = None
 
         if label_source == "full text" and self.label_items:
             light = self.light.infer(source_text, sheet_hint=current_section)
@@ -640,7 +659,42 @@ class LabelMatcher:
                 if len(alts) > 1:
                     alt2_label, alt2_score = alts[1]["label"], round(float(alts[1]["score"]), 3)
 
-        # If the lightweight tiers didn’t confidently hit, use the existing fuzzy token_set matching
+        sheet_hint_for_semantic = current_section or self.cfg.get("sheet_prefix") or getattr(self, "current_sheet_prefix", None)
+        if best_item is None and self.semantic_inferencer:
+            if not self.semantic_inferencer.is_available():
+                disabled_reason = self.semantic_inferencer.disabled_reason()
+                if disabled_reason and not label_method_info:
+                    label_method_info = disabled_reason[:160]
+            else:
+                try:
+                    semantic_result = self.semantic_inferencer.match(
+                        source_text,
+                        sheet_hint=sheet_hint_for_semantic,
+                        top_k=self.cfg.get("neural_top_k"),
+                    )
+                except Exception as exc:
+                    self.logger.warning("Semantic inferencer failed: %s", exc)
+                    semantic_result = None
+
+                if semantic_result and semantic_result.best:
+                    min_neural_conf = float(self.cfg.get("neural_accept_min_confidence", 0.60))
+                    if semantic_result.best.confidence >= min_neural_conf:
+                        best_item = dict(semantic_result.best.item)
+                        sim = float(semantic_result.best.confidence)
+                        label_method = "semantic_crossencoder"
+                        label_method_info = semantic_result.debug_summary()[:160]
+                        if len(semantic_result.candidates) > 1:
+                            alt1_label = semantic_result.candidates[1].item.get("label", "")
+                            alt1_score = round(float(semantic_result.candidates[1].confidence), 3)
+                        if len(semantic_result.candidates) > 2:
+                            alt2_label = semantic_result.candidates[2].item.get("label", "")
+                            alt2_score = round(float(semantic_result.candidates[2].confidence), 3)
+                    else:
+                        info = semantic_result.debug_summary()
+                        if info:
+                            label_method_info = info[:160]
+
+        # If the lightweight tiers didn't confidently hit, use the existing fuzzy token_set matching
         if best_item is None:
             best_item, sim = _match_label_item(source_text, self.label_items, current_section, strict, loose)
         elif sim < self.cfg.get("accept_min_sim", 0.75):
@@ -806,7 +860,7 @@ class LabelMatcher:
             "flag_reason": "; ".join(flag_reasons),
 
             # labeling method info
-            "label_method": label_method,  # 'light:rules' | 'light:bm25' | 'light:tfidf' | 'fuzzy' | 'cause_effect_fallback' | 'sheet_fallback'
+            "label_method": label_method,  # 'light:rules' | 'light:bm25' | 'light:tfidf' | 'semantic_crossencoder' | 'fuzzy' | 'cause_effect_crosscheck' | 'cause_effect_fallback' | 'sheet_fallback'
             "label_method_info": label_method_info,  # small hint like matched keywords or fallback reason
 
             # top alternative labels (for analysis)
